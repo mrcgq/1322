@@ -1391,6 +1391,10 @@ func selectBackend(backends []Backend, key string) Backend {
 	return backends[0]
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// 【修改对象】：xlink内核端代码.go -> dialZeusWebSocket
+// 【修复内容】：防范 Double Port 包裹导致的底层 DialTimeout 崩溃
+// ═══════════════════════════════════════════════════════════════════════════════
 func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Conn, error) {
 	sniHost, sniPort, err := net.SplitHostPort(sni)
 	if err != nil {
@@ -1412,9 +1416,29 @@ func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Co
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: sniHost},
 		HandshakeTimeout: wsHandshakeTimeout,
 	}
+
 	if backend.IP != "" {
 		dialer.NetDial = func(network, _ string) (net.Conn, error) {
-			return net.DialTimeout(network, net.JoinHostPort(backend.IP, dialPort), wsHandshakeTimeout)
+			// ★ 核心修复：安全分离与清理
+			finalHost := backend.IP
+			finalPort := dialPort
+
+			// 如果 backend.IP 已经是带端口的格式（如 [2602::1]:443 或 1.2.3.4:8443）
+			if h, p, err := net.SplitHostPort(backend.IP); err == nil {
+				finalHost = h
+				if p != "" {
+					finalPort = p
+				}
+			}
+
+			// 清理残留的中括号，防止 net.JoinHostPort 重复嵌套导致崩溃
+			cleanHost := finalHost
+			if strings.HasPrefix(cleanHost, "[") && strings.HasSuffix(cleanHost, "]") {
+				cleanHost = cleanHost[1 : len(cleanHost)-1]
+			}
+
+			targetAddr := net.JoinHostPort(cleanHost, finalPort)
+			return net.DialTimeout(network, targetAddr, wsHandshakeTimeout)
 		}
 	}
 
