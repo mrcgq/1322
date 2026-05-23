@@ -1,6 +1,3 @@
-
-//xlink内核端代码
-
 //go:build binary
 // +build binary
 
@@ -45,7 +42,7 @@ const (
 	tlsHandshakeTimeout = 5 * time.Second
 
 	// 【Watchdog 参数】焦油坑防御阈值
-	stallTimeout = 20 * time.Second
+	stallTimeout  = 20 * time.Second
 	stallMinBytes = 512
 
 	socks5Version byte = 0x05
@@ -726,15 +723,55 @@ var (
 
 var bufPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }}
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// 【修改点四】：parseNode 修复纯域名节点错误覆盖 Backend.IP 的 Bug
+//
+// 问题根源：原代码对无 # 分隔符的节点统一将 Backend.IP 设为节点字符串本身，
+//   导致纯域名节点（如 6523.pages.dev）的 Backend.IP = "6523.pages.dev"，
+//   而非空字符串。这使得 connectNanoTunnel 中 backend.IP != "" 的判断始终成立，
+//   系统跳过了「回退到 settings.ServerIP（用户配置的指定 IP）」的逻辑，
+//   最终连接目标与预期完全不符。
+//
+// 修复策略：区分节点字符串的物理类型——
+//   • 纯 IP / IP:Port → Backend.IP 设为该 IP，系统直连该地址；
+//   • 纯域名           → Backend.IP 设为 ""，系统回退到 settings.ServerIP。
+//
+// 物理路径（修复后）：
+//   parseNode("6523.pages.dev") → Backend{IP: "", Port: ""}
+//   connectNanoTunnel: backend.IP == "" → backend.IP = settings.ServerIP（172.64.52.195）
+//   dialZeusWebSocket: 物理连接 → 172.64.52.195:443，SNI → 6523.pages.dev ✓
+// ═══════════════════════════════════════════════════════════════════════════════
 func parseNode(nodeStr string) Node {
 	var n Node
 	parts := strings.SplitN(nodeStr, "#", 2)
 	n.Domain = strings.TrimSpace(parts[0])
+
 	if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
-		n.Backends = append(n.Backends, Backend{IP: n.Domain, Port: "", Weight: 1})
+		// ── 【核心修复】：区分纯 IP 节点与纯域名节点 ──────────────────────────
+		// 提取裸 host，剥离可能携带的端口（如 1.2.3.4:8080）
+		host := n.Domain
+		if h, _, err := net.SplitHostPort(n.Domain); err == nil {
+			host = h
+		}
+
+		if net.ParseIP(host) != nil {
+			// 情形 A：节点本身是 IP 地址（或 IP:Port）
+			// → Backend.IP 设为该 IP，dialZeusWebSocket 直连该地址
+			n.Backends = append(n.Backends, Backend{IP: n.Domain, Port: "", Weight: 1})
+		} else {
+			// 情形 B：节点是纯域名（如 6523.pages.dev、worker.example.com）
+			// → Backend.IP 留空，触发 connectNanoTunnel 中的 ServerIP 回退逻辑：
+			//     if backend.IP == "" { backend.IP = settings.ServerIP }
+			// 这样物理连接打向用户配置的「指定 IP」，SNI 仍使用节点域名，
+			// 实现 SNI 与物理目标的解耦（IP 前置 + 域名伪装）。
+			n.Backends = append(n.Backends, Backend{IP: "", Port: "", Weight: 1})
+		}
 		return n
 	}
 
+	// ── 有 # 分隔符：解析显式 Backend 列表（逻辑不变）─────────────────────────
+	// 格式：<domain>#<ip:port|weight>,<ip:port|weight>,...
+	// 此路径下 Backend.IP 由用户显式指定，无需推断，直接解析即可。
 	for _, e := range strings.Split(strings.TrimSpace(parts[1]), ",") {
 		e = strings.TrimSpace(e)
 		if e == "" {
@@ -1038,7 +1075,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			mode += fmt.Sprintf("+%dRules", len(routingMap))
 		}
 	}
-	log.Printf("[Core] v21.9 listening:%s mode:%s", inbound.Listen, mode)
+	log.Printf("[Core] v21.10 listening:%s mode:%s", inbound.Listen, mode)
 
 	maintenanceStopCh = make(chan struct{})
 
