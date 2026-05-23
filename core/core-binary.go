@@ -230,9 +230,15 @@ type DNSResolver struct {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 【修改点一】：NewDNSResolver 恢复 DoH 的 TLS 证书校验（Law-34 原子防御）
-// 原代码 InsecureSkipVerify: true 完全暴露于 MITM 攻击，现予以修复。
-// DoH 服务器（阿里/Google）均持有受信 CA 签发证书，无需跳过验证。
+// 【修复一】NewDNSResolver：恢复 DoH TLS 证书强制校验（Law-34 原子防御）
+//
+// 问题：原代码 InsecureSkipVerify: true 导致 DoH 流量完全裸奔，
+//       中间人（MITM）可任意伪造 DNS 响应，将出站流量引向黑洞或监控节点。
+//
+// 修复：InsecureSkipVerify 改回 false（Go tls.Config 的零值默认即为 false，
+//       此处显式写出以示郑重，防止后续维护者误改）。
+//       阿里 DoH（223.5.5.5）与 Google DoH（dns.google）均持有受信 CA 签发证书，
+//       无任何理由跳过验证。
 // ═══════════════════════════════════════════════════════════════════════════════
 func NewDNSResolver(config DNSConfig) *DNSResolver {
 	transport := &http.Transport{
@@ -240,7 +246,7 @@ func NewDNSResolver(config DNSConfig) *DNSResolver {
 			Timeout:   time.Duration(config.TimeoutMs) * time.Millisecond,
 			DualStack: true,
 		}).DialContext,
-		// 【已修复】恢复 TLS 证书校验，防止 DoH 响应被 MITM 伪造劫持
+		// 【已修复】恢复 TLS 证书强制校验，防止 DoH 响应被 MITM 伪造劫持
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: false,
 		},
@@ -724,22 +730,25 @@ var (
 var bufPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }}
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 【修改点四】：parseNode 修复纯域名节点错误覆盖 Backend.IP 的 Bug
+// 【修复二】parseNode：精准剥离 IPv6 括号，正确区分物理 IP 与语义域名
 //
-// 问题根源：原代码对无 # 分隔符的节点统一将 Backend.IP 设为节点字符串本身，
-//   导致纯域名节点（如 6523.pages.dev）的 Backend.IP = "6523.pages.dev"，
-//   而非空字符串。这使得 connectNanoTunnel 中 backend.IP != "" 的判断始终成立，
-//   系统跳过了「回退到 settings.ServerIP（用户配置的指定 IP）」的逻辑，
-//   最终连接目标与预期完全不符。
+// 问题根源：原代码对无 # 分隔符的节点统一将 Backend.IP 设为节点字符串本身。
+//   • 纯域名节点（如 6523.pages.dev）→ Backend.IP = "6523.pages.dev"
+//     导致 connectNanoTunnel 中 backend.IP != "" 判断成立，跳过 ServerIP 回退，
+//     本地 DNS 解析失败，节点直接不通。
+//   • 带端口的 IPv6 节点（如 [2602:...]:443）→ net.ParseIP 无法识别带括号字符串，
+//     被误判为域名，同样触发错误的 ServerIP 回退逻辑。
 //
-// 修复策略：区分节点字符串的物理类型——
-//   • 纯 IP / IP:Port → Backend.IP 设为该 IP，系统直连该地址；
-//   • 纯域名           → Backend.IP 设为 ""，系统回退到 settings.ServerIP。
+// 修复策略（三步走）：
+//   Step 1：net.SplitHostPort 精确分离 host 与 port（兼容 [IPv6]:port 格式）
+//   Step 2：剥离 IPv6 物理中括号，得到裸 IP 字符串供 net.ParseIP 识别
+//   Step 3：净 IP → Backend.IP 设为裸 IP；纯域名 → Backend.IP 留空触发回退
 //
 // 物理路径（修复后）：
-//   parseNode("6523.pages.dev") → Backend{IP: "", Port: ""}
-//   connectNanoTunnel: backend.IP == "" → backend.IP = settings.ServerIP（172.64.52.195）
-//   dialZeusWebSocket: 物理连接 → 172.64.52.195:443，SNI → 6523.pages.dev ✓
+//   parseNode("6523.pages.dev")     → Backend{IP: "",              Port: ""}
+//   parseNode("[2602::1]:443")       → Backend{IP: "2602::1",       Port: "443"}
+//   parseNode("1.2.3.4")            → Backend{IP: "1.2.3.4",       Port: ""}
+//   parseNode("1.2.3.4:8080")       → Backend{IP: "1.2.3.4",       Port: "8080"}
 // ═══════════════════════════════════════════════════════════════════════════════
 func parseNode(nodeStr string) Node {
 	var n Node
@@ -747,23 +756,37 @@ func parseNode(nodeStr string) Node {
 	n.Domain = strings.TrimSpace(parts[0])
 
 	if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
-		// ── 【核心修复】：区分纯 IP 节点与纯域名节点 ──────────────────────────
-		// 提取裸 host，剥离可能携带的端口（如 1.2.3.4:8080）
-		host := n.Domain
-		if h, _, err := net.SplitHostPort(n.Domain); err == nil {
-			host = h
+		// ── Step 1：精确分离 host 与 port ──────────────────────────────────────
+		// net.SplitHostPort 能正确处理 [IPv6]:port / IPv4:port / bare-host 三种格式。
+		// 对于无端口的裸字符串（如 "6523.pages.dev"、"1.2.3.4"），会返回 err，
+		// 此时 host = n.Domain，port = ""，符合预期。
+		host, port, err := net.SplitHostPort(n.Domain)
+		if err != nil {
+			// 无端口的裸字符串：host 就是整个 Domain
+			host = n.Domain
+			port = ""
 		}
 
-		if net.ParseIP(host) != nil {
-			// 情形 A：节点本身是 IP 地址（或 IP:Port）
-			// → Backend.IP 设为该 IP，dialZeusWebSocket 直连该地址
-			n.Backends = append(n.Backends, Backend{IP: n.Domain, Port: "", Weight: 1})
+		// ── Step 2：剥离 IPv6 物理中括号 ───────────────────────────────────────
+		// net.SplitHostPort 对 "[2602::1]:443" 返回 host = "2602::1"（已剥离）。
+		// 但若用户直接写 "[2602::1]"（无端口），SplitHostPort 会报错，
+		// 此时 host = "[2602::1]"，需手动剥离才能让 net.ParseIP 正确识别。
+		cleanHost := host
+		if strings.HasPrefix(cleanHost, "[") && strings.HasSuffix(cleanHost, "]") {
+			cleanHost = cleanHost[1 : len(cleanHost)-1]
+		}
+
+		// ── Step 3：物理判定 ────────────────────────────────────────────────────
+		if net.ParseIP(cleanHost) != nil {
+			// 情形 A：节点是纯 IP（含 IPv4 / IPv6）
+			// Backend.IP 设为裸 IP（已剥离括号），dialZeusWebSocket 直连此地址。
+			// Port 保留用户显式指定的值（可为空，空时由 dialZeusWebSocket 取 sniPort）。
+			n.Backends = append(n.Backends, Backend{IP: cleanHost, Port: port, Weight: 1})
 		} else {
 			// 情形 B：节点是纯域名（如 6523.pages.dev、worker.example.com）
-			// → Backend.IP 留空，触发 connectNanoTunnel 中的 ServerIP 回退逻辑：
-			//     if backend.IP == "" { backend.IP = settings.ServerIP }
-			// 这样物理连接打向用户配置的「指定 IP」，SNI 仍使用节点域名，
-			// 实现 SNI 与物理目标的解耦（IP 前置 + 域名伪装）。
+			// Backend.IP 必须留空！connectNanoTunnel 检测到 backend.IP == "" 时，
+			// 会将其赋值为 settings.ServerIP（用户配置的「指定 IP / 回源 IP」），
+			// 从而实现：物理连接 → ServerIP，SNI → 节点域名，两者解耦。
 			n.Backends = append(n.Backends, Backend{IP: "", Port: "", Weight: 1})
 		}
 		return n
@@ -771,7 +794,7 @@ func parseNode(nodeStr string) Node {
 
 	// ── 有 # 分隔符：解析显式 Backend 列表（逻辑不变）─────────────────────────
 	// 格式：<domain>#<ip:port|weight>,<ip:port|weight>,...
-	// 此路径下 Backend.IP 由用户显式指定，无需推断，直接解析即可。
+	// Backend.IP 由用户显式指定，直接解析即可，无需推断。
 	for _, e := range strings.Split(strings.TrimSpace(parts[1]), ",") {
 		e = strings.TrimSpace(e)
 		if e == "" {
@@ -1292,7 +1315,6 @@ func connectNanoTunnel(target, outboundTag string, payload []byte) (*SafeWS, err
 
 		safe := &SafeWS{conn: wsConn}
 
-		// 【已修改】传入 secretKey 供 XOR 混淆层使用
 		if err := sendNanoHeaderV2(safe, target, payload, socks5Addr, fallback, secretKey); err != nil {
 			wsConn.Close()
 			return nil, &TunnelError{Stage: "send_header", Err: err}
@@ -1407,13 +1429,11 @@ func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Co
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 【修改点二】：pipeDirect 增加 RTT 流速看门狗（Law-50 焦油坑自救）
+// 【Watchdog】pipeDirect：双向转发 + RTT 流速看门狗（Law-50 焦油坑自救）
 //
-// 双指标防御机制：
-//   1. stallTimeout(20s)：每次 Read 超时触发检查
-//   2. stallMinBytes(512B)：超时周期内累计接收量低于阈值则判定为焦油坑并强断
-//
-// 上行（本地→WS）与下行（WS→本地）均独立设置截止时间，防止单向挂死。
+// 防御机制：
+//   • stallTimeout(20s)：每次 Read/Write 超时触发检查
+//   • stallMinBytes(512B)：超时周期内累计量低于阈值则判定焦油坑并强断
 // ═══════════════════════════════════════════════════════════════════════════════
 func pipeDirect(local net.Conn, ws *SafeWS, target string) {
 	var upBytes, downBytes int64
@@ -1430,7 +1450,6 @@ func pipeDirect(local net.Conn, ws *SafeWS, target string) {
 		var accumulated int64
 
 		for {
-			// 每次读取前刷新本地写截止时间，防止下行焦油坑挂死
 			local.SetWriteDeadline(time.Now().Add(stallTimeout))
 
 			mt, r, err := ws.NextReader()
@@ -1445,7 +1464,6 @@ func pipeDirect(local net.Conn, ws *SafeWS, target string) {
 					accumulated += n
 				}
 				if copyErr != nil {
-					// 检测写超时：若当前周期字节量过低，判定为焦油坑并强断
 					if netErr, ok := copyErr.(net.Error); ok && netErr.Timeout() {
 						if accumulated < stallMinBytes {
 							log.Printf("[Watchdog] 下行焦油坑 target:%s 周期流量:%d < %d，强断自救",
@@ -1473,7 +1491,6 @@ func pipeDirect(local net.Conn, ws *SafeWS, target string) {
 		var accumulated int64
 
 		for {
-			// 每次读取前刷新本地读截止时间，防止上行焦油坑挂死
 			local.SetReadDeadline(time.Now().Add(stallTimeout))
 
 			n, err := local.Read(buf)
@@ -1487,14 +1504,12 @@ func pipeDirect(local net.Conn, ws *SafeWS, target string) {
 				}
 			}
 			if err != nil {
-				// 检测读超时：若当前周期字节量过低，判定为焦油坑并强断
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					if accumulated < stallMinBytes {
 						log.Printf("[Watchdog] 上行焦油坑 target:%s 周期流量:%d < %d，强断自救",
 							target, accumulated, stallMinBytes)
 						break
 					}
-					// 当前周期流量达标，重置计数继续
 					accumulated = 0
 					continue
 				}
@@ -1526,14 +1541,12 @@ func formatBytes(b int64) string {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 【修改点三】：sendNanoHeaderV2 增加一阶滚动 XOR 混淆层（RE-28 协议即设计）
+// 【sendNanoHeaderV2】：构造并发送协议控制头（含 XOR 混淆层）
 //
-// 新增参数 token string：用于派生 XOR 混淆密钥（MD5(token)）。
-//
-// 混淆范围：仅对协议控制头部（host/port/s5/fb 字段）实施 XOR 混淆。
-// 应用层 payload（已加密的真实流量）不参与混淆，避免双重处理开销。
-//
-// 服务端解密：调用相同的 xorObfuscate(headerBytes, token) 即可还原明文头部。
+// 协议格式（明文）：
+//   [hostLen:1B][host:hostLen][port:2B BE][s5Len:1B][s5:s5Len][fbLen:1B][fb:fbLen]
+// 线上格式：
+//   XOR 混淆后的控制头 + 原始 payload（明文直接拼接）
 // ═══════════════════════════════════════════════════════════════════════════════
 func sendNanoHeaderV2(wsConn *SafeWS, target string, payload []byte, s5, fb string, token string) error {
 	host, portStr, _ := net.SplitHostPort(target)
@@ -1569,11 +1582,10 @@ func sendNanoHeaderV2(wsConn *SafeWS, target string, payload []byte, s5, fb stri
 		headerBuf.Write(fbb)
 	}
 
-	// 【核心】对协议控制头实施一阶滚动 XOR 混淆
-	// 混淆后头部字节呈高熵随机分布，DPI 设备无法识别明文域名（RE-28）
+	// 对协议控制头实施一阶滚动 XOR 混淆（RE-28）
 	obfuscatedHeader := xorObfuscate(headerBuf.Bytes(), token)
 
-	// 将混淆头与原始 payload 拼合后一次性发送
+	// 混淆头 + 原始 payload 拼合后一次性发送
 	finalBuf := new(bytes.Buffer)
 	finalBuf.Write(obfuscatedHeader)
 	if len(payload) > 0 {
