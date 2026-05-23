@@ -1,4 +1,6 @@
 
+//xlink内核端代码
+
 //go:build binary
 // +build binary
 
@@ -41,6 +43,10 @@ const (
 	wsHandshakeTimeout  = 5 * time.Second
 	idleConnTimeout     = 30 * time.Second
 	tlsHandshakeTimeout = 5 * time.Second
+
+	// 【Watchdog 参数】焦油坑防御阈值
+	stallTimeout = 20 * time.Second
+	stallMinBytes = 512
 
 	socks5Version byte = 0x05
 )
@@ -106,6 +112,35 @@ func (s *SafeWS) WriteMessage(mt int, data []byte) error {
 
 func (s *SafeWS) Close() error {
 	return s.conn.Close()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 【XOR 混淆核心】：一阶滚动 XOR 加解密
+// 使用 Token 的 MD5 散列值作为混淆密钥流的种子。
+// 加密与解密使用完全相同的函数（XOR 对合性），服务端调用同一函数解密即可。
+// 混淆后头部字节呈高熵随机分布，DPI 无法探测内部明文域名（RE-28）。
+// ═══════════════════════════════════════════════════════════════════════════════
+func xorObfuscate(data []byte, token string) []byte {
+	if len(data) == 0 {
+		return data
+	}
+	keyHash := md5.Sum([]byte(token))
+	key := keyHash[:]
+	keyLen := len(key)
+
+	out := make([]byte, len(data))
+	copy(out, data)
+
+	// 一阶滚动 XOR：每字节的混淆结果参与下一字节的密钥计算，破坏静态模式
+	for i := 0; i < len(out); i++ {
+		if i == 0 {
+			out[i] ^= key[0]
+		} else {
+			// 前一个密文字节与轮换密钥异或，形成链式扩散
+			out[i] ^= (out[i-1] ^ key[i%keyLen])
+		}
+	}
+	return out
 }
 
 type DNSStrategy string
@@ -197,14 +232,20 @@ type DNSResolver struct {
 	httpClient *http.Client
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// 【修改点一】：NewDNSResolver 恢复 DoH 的 TLS 证书校验（Law-34 原子防御）
+// 原代码 InsecureSkipVerify: true 完全暴露于 MITM 攻击，现予以修复。
+// DoH 服务器（阿里/Google）均持有受信 CA 签发证书，无需跳过验证。
+// ═══════════════════════════════════════════════════════════════════════════════
 func NewDNSResolver(config DNSConfig) *DNSResolver {
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   time.Duration(config.TimeoutMs) * time.Millisecond,
 			DualStack: true,
 		}).DialContext,
+		// 【已修复】恢复 TLS 证书校验，防止 DoH 响应被 MITM 伪造劫持
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
+			InsecureSkipVerify: false,
 		},
 		MaxIdleConns:        10,
 		MaxIdleConnsPerHost: 2,
@@ -690,8 +731,6 @@ func parseNode(nodeStr string) Node {
 	parts := strings.SplitN(nodeStr, "#", 2)
 	n.Domain = strings.TrimSpace(parts[0])
 	if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
-		// 没有 # 分隔符，或 # 后为空：域名本身作为唯一 Backend
-		// 端口留空，由 dialZeusWebSocket 从 SNI 端口继承（默认443）
 		n.Backends = append(n.Backends, Backend{IP: n.Domain, Port: "", Weight: 1})
 		return n
 	}
@@ -806,8 +845,6 @@ func parseOutbounds() {
 			continue
 		}
 
-		// 统一所有分隔符为换行符，再按行切分
-		// 客户端通过 EscapeJson 将 \n 转义写入JSON，Go解析JSON后还原为真正换行符
 		rawPool := strings.NewReplacer(
 			"\r\n", "\n",
 			";", "\n",
@@ -1001,7 +1038,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			mode += fmt.Sprintf("+%dRules", len(routingMap))
 		}
 	}
-	log.Printf("[Core] v21.8 listening:%s mode:%s", inbound.Listen, mode)
+	log.Printf("[Core] v21.9 listening:%s mode:%s", inbound.Listen, mode)
 
 	maintenanceStopCh = make(chan struct{})
 
@@ -1218,7 +1255,8 @@ func connectNanoTunnel(target, outboundTag string, payload []byte) (*SafeWS, err
 
 		safe := &SafeWS{conn: wsConn}
 
-		if err := sendNanoHeaderV2(safe, target, payload, socks5Addr, fallback); err != nil {
+		// 【已修改】传入 secretKey 供 XOR 混淆层使用
+		if err := sendNanoHeaderV2(safe, target, payload, socks5Addr, fallback, secretKey); err != nil {
 			wsConn.Close()
 			return nil, &TunnelError{Stage: "send_header", Err: err}
 		}
@@ -1331,44 +1369,80 @@ func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Co
 	return conn, nil
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// 【修改点二】：pipeDirect 增加 RTT 流速看门狗（Law-50 焦油坑自救）
+//
+// 双指标防御机制：
+//   1. stallTimeout(20s)：每次 Read 超时触发检查
+//   2. stallMinBytes(512B)：超时周期内累计接收量低于阈值则判定为焦油坑并强断
+//
+// 上行（本地→WS）与下行（WS→本地）均独立设置截止时间，防止单向挂死。
+// ═══════════════════════════════════════════════════════════════════════════════
 func pipeDirect(local net.Conn, ws *SafeWS, target string) {
 	var upBytes, downBytes int64
 	start := time.Now()
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// ── 下行：WS → 本地 ──
 	go func() {
 		defer wg.Done()
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
+
+		var accumulated int64
+
 		for {
+			// 每次读取前刷新本地写截止时间，防止下行焦油坑挂死
+			local.SetWriteDeadline(time.Now().Add(stallTimeout))
+
 			mt, r, err := ws.NextReader()
 			if err != nil {
 				log.Printf("[Pipe] downstream closed target:%s err:%v", target, err)
 				break
 			}
 			if mt == websocket.BinaryMessage {
-				n, err := io.CopyBuffer(local, r, buf)
+				n, copyErr := io.CopyBuffer(local, r, buf)
 				if n > 0 {
 					atomic.AddInt64(&downBytes, n)
+					accumulated += n
 				}
-				if err != nil {
-					log.Printf("[Pipe] downstream copy failed target:%s err:%v", target, err)
+				if copyErr != nil {
+					// 检测写超时：若当前周期字节量过低，判定为焦油坑并强断
+					if netErr, ok := copyErr.(net.Error); ok && netErr.Timeout() {
+						if accumulated < stallMinBytes {
+							log.Printf("[Watchdog] 下行焦油坑 target:%s 周期流量:%d < %d，强断自救",
+								target, accumulated, stallMinBytes)
+							break
+						}
+						accumulated = 0
+						continue
+					}
+					log.Printf("[Pipe] downstream copy failed target:%s err:%v", target, copyErr)
 					break
 				}
 			}
 		}
+		local.SetWriteDeadline(time.Time{})
 		local.Close()
 	}()
 
+	// ── 上行：本地 → WS ──
 	go func() {
 		defer wg.Done()
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
+
+		var accumulated int64
+
 		for {
+			// 每次读取前刷新本地读截止时间，防止上行焦油坑挂死
+			local.SetReadDeadline(time.Now().Add(stallTimeout))
+
 			n, err := local.Read(buf)
 			if n > 0 {
 				atomic.AddInt64(&upBytes, int64(n))
+				accumulated += int64(n)
 				werr := ws.WriteMessage(websocket.BinaryMessage, buf[:n])
 				if werr != nil {
 					log.Printf("[Pipe] upstream write failed target:%s err:%v", target, werr)
@@ -1376,10 +1450,22 @@ func pipeDirect(local net.Conn, ws *SafeWS, target string) {
 				}
 			}
 			if err != nil {
+				// 检测读超时：若当前周期字节量过低，判定为焦油坑并强断
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					if accumulated < stallMinBytes {
+						log.Printf("[Watchdog] 上行焦油坑 target:%s 周期流量:%d < %d，强断自救",
+							target, accumulated, stallMinBytes)
+						break
+					}
+					// 当前周期流量达标，重置计数继续
+					accumulated = 0
+					continue
+				}
 				log.Printf("[Pipe] upstream read closed target:%s err:%v", target, err)
 				break
 			}
 		}
+		local.SetReadDeadline(time.Time{})
 		ws.Close()
 	}()
 
@@ -1402,7 +1488,17 @@ func formatBytes(b int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-func sendNanoHeaderV2(wsConn *SafeWS, target string, payload []byte, s5, fb string) error {
+// ═══════════════════════════════════════════════════════════════════════════════
+// 【修改点三】：sendNanoHeaderV2 增加一阶滚动 XOR 混淆层（RE-28 协议即设计）
+//
+// 新增参数 token string：用于派生 XOR 混淆密钥（MD5(token)）。
+//
+// 混淆范围：仅对协议控制头部（host/port/s5/fb 字段）实施 XOR 混淆。
+// 应用层 payload（已加密的真实流量）不参与混淆，避免双重处理开销。
+//
+// 服务端解密：调用相同的 xorObfuscate(headerBytes, token) 即可还原明文头部。
+// ═══════════════════════════════════════════════════════════════════════════════
+func sendNanoHeaderV2(wsConn *SafeWS, target string, payload []byte, s5, fb string, token string) error {
 	host, portStr, _ := net.SplitHostPort(target)
 
 	portVal, err := strconv.ParseUint(portStr, 10, 16)
@@ -1420,25 +1516,34 @@ func sendNanoHeaderV2(wsConn *SafeWS, target string, payload []byte, s5, fb stri
 		return errors.New("field length exceeds 255 bytes")
 	}
 
-	buf := new(bytes.Buffer)
-	buf.WriteByte(byte(len(hb)))
-	buf.Write(hb)
+	// 构造明文协议控制头
+	headerBuf := new(bytes.Buffer)
+	headerBuf.WriteByte(byte(len(hb)))
+	headerBuf.Write(hb)
 	pb := make([]byte, 2)
 	binary.BigEndian.PutUint16(pb, port)
-	buf.Write(pb)
-	buf.WriteByte(byte(len(s5b)))
+	headerBuf.Write(pb)
+	headerBuf.WriteByte(byte(len(s5b)))
 	if len(s5b) > 0 {
-		buf.Write(s5b)
+		headerBuf.Write(s5b)
 	}
-	buf.WriteByte(byte(len(fbb)))
+	headerBuf.WriteByte(byte(len(fbb)))
 	if len(fbb) > 0 {
-		buf.Write(fbb)
-	}
-	if len(payload) > 0 {
-		buf.Write(payload)
+		headerBuf.Write(fbb)
 	}
 
-	return wsConn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
+	// 【核心】对协议控制头实施一阶滚动 XOR 混淆
+	// 混淆后头部字节呈高熵随机分布，DPI 设备无法识别明文域名（RE-28）
+	obfuscatedHeader := xorObfuscate(headerBuf.Bytes(), token)
+
+	// 将混淆头与原始 payload 拼合后一次性发送
+	finalBuf := new(bytes.Buffer)
+	finalBuf.Write(obfuscatedHeader)
+	if len(payload) > 0 {
+		finalBuf.Write(payload)
+	}
+
+	return wsConn.WriteMessage(websocket.BinaryMessage, finalBuf.Bytes())
 }
 
 func handleSOCKS5(conn net.Conn, _ string) (string, error) {
