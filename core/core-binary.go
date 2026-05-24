@@ -1,3 +1,12 @@
+
+
+
+
+
+
+//新xlink内核端代码
+
+
 //go:build binary
 // +build binary
 
@@ -40,10 +49,6 @@ const (
 	wsHandshakeTimeout  = 5 * time.Second
 	idleConnTimeout     = 30 * time.Second
 	tlsHandshakeTimeout = 5 * time.Second
-
-	// 【Watchdog 参数】焦油坑防御阈值
-	stallTimeout  = 20 * time.Second
-	stallMinBytes = 512
 
 	socks5Version byte = 0x05
 )
@@ -109,35 +114,6 @@ func (s *SafeWS) WriteMessage(mt int, data []byte) error {
 
 func (s *SafeWS) Close() error {
 	return s.conn.Close()
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// 【XOR 混淆核心】：一阶滚动 XOR 加解密
-// 使用 Token 的 MD5 散列值作为混淆密钥流的种子。
-// 加密与解密使用完全相同的函数（XOR 对合性），服务端调用同一函数解密即可。
-// 混淆后头部字节呈高熵随机分布，DPI 无法探测内部明文域名（RE-28）。
-// ═══════════════════════════════════════════════════════════════════════════════
-func xorObfuscate(data []byte, token string) []byte {
-	if len(data) == 0 {
-		return data
-	}
-	keyHash := md5.Sum([]byte(token))
-	key := keyHash[:]
-	keyLen := len(key)
-
-	out := make([]byte, len(data))
-	copy(out, data)
-
-	// 一阶滚动 XOR：每字节的混淆结果参与下一字节的密钥计算，破坏静态模式
-	for i := 0; i < len(out); i++ {
-		if i == 0 {
-			out[i] ^= key[0]
-		} else {
-			// 前一个密文字节与轮换密钥异或，形成链式扩散
-			out[i] ^= (out[i-1] ^ key[i%keyLen])
-		}
-	}
-	return out
 }
 
 type DNSStrategy string
@@ -229,26 +205,14 @@ type DNSResolver struct {
 	httpClient *http.Client
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 【修复一】NewDNSResolver：恢复 DoH TLS 证书强制校验（Law-34 原子防御）
-//
-// 问题：原代码 InsecureSkipVerify: true 导致 DoH 流量完全裸奔，
-//       中间人（MITM）可任意伪造 DNS 响应，将出站流量引向黑洞或监控节点。
-//
-// 修复：InsecureSkipVerify 改回 false（Go tls.Config 的零值默认即为 false，
-//       此处显式写出以示郑重，防止后续维护者误改）。
-//       阿里 DoH（223.5.5.5）与 Google DoH（dns.google）均持有受信 CA 签发证书，
-//       无任何理由跳过验证。
-// ═══════════════════════════════════════════════════════════════════════════════
 func NewDNSResolver(config DNSConfig) *DNSResolver {
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   time.Duration(config.TimeoutMs) * time.Millisecond,
 			DualStack: true,
 		}).DialContext,
-		// 【已修复】恢复 TLS 证书强制校验，防止 DoH 响应被 MITM 伪造劫持
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: false,
+			InsecureSkipVerify: true,
 		},
 		MaxIdleConns:        10,
 		MaxIdleConnsPerHost: 2,
@@ -729,72 +693,17 @@ var (
 
 var bufPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }}
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 【修复二】parseNode：精准剥离 IPv6 括号，正确区分物理 IP 与语义域名
-//
-// 问题根源：原代码对无 # 分隔符的节点统一将 Backend.IP 设为节点字符串本身。
-//   • 纯域名节点（如 6523.pages.dev）→ Backend.IP = "6523.pages.dev"
-//     导致 connectNanoTunnel 中 backend.IP != "" 判断成立，跳过 ServerIP 回退，
-//     本地 DNS 解析失败，节点直接不通。
-//   • 带端口的 IPv6 节点（如 [2602:...]:443）→ net.ParseIP 无法识别带括号字符串，
-//     被误判为域名，同样触发错误的 ServerIP 回退逻辑。
-//
-// 修复策略（三步走）：
-//   Step 1：net.SplitHostPort 精确分离 host 与 port（兼容 [IPv6]:port 格式）
-//   Step 2：剥离 IPv6 物理中括号，得到裸 IP 字符串供 net.ParseIP 识别
-//   Step 3：净 IP → Backend.IP 设为裸 IP；纯域名 → Backend.IP 留空触发回退
-//
-// 物理路径（修复后）：
-//   parseNode("6523.pages.dev")     → Backend{IP: "",              Port: ""}
-//   parseNode("[2602::1]:443")       → Backend{IP: "2602::1",       Port: "443"}
-//   parseNode("1.2.3.4")            → Backend{IP: "1.2.3.4",       Port: ""}
-//   parseNode("1.2.3.4:8080")       → Backend{IP: "1.2.3.4",       Port: "8080"}
-// ═══════════════════════════════════════════════════════════════════════════════
 func parseNode(nodeStr string) Node {
 	var n Node
 	parts := strings.SplitN(nodeStr, "#", 2)
 	n.Domain = strings.TrimSpace(parts[0])
-
 	if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
-		// ── Step 1：精确分离 host 与 port ──────────────────────────────────────
-		// net.SplitHostPort 能正确处理 [IPv6]:port / IPv4:port / bare-host 三种格式。
-		// 对于无端口的裸字符串（如 "6523.pages.dev"、"1.2.3.4"），会返回 err，
-		// 此时 host = n.Domain，port = ""，符合预期。
-		host, port, err := net.SplitHostPort(n.Domain)
-		if err != nil {
-			// 无端口的裸字符串：host 就是整个 Domain
-			host = n.Domain
-			port = ""
-		}
-
-		// ── Step 2：剥离 IPv6 物理中括号 ───────────────────────────────────────
-		// net.SplitHostPort 对 "[2602::1]:443" 返回 host = "2602::1"（已剥离）。
-		// 但若用户直接写 "[2602::1]"（无端口），SplitHostPort 会报错，
-		// 此时 host = "[2602::1]"，需手动剥离才能让 net.ParseIP 正确识别。
-		cleanHost := host
-		if strings.HasPrefix(cleanHost, "[") && strings.HasSuffix(cleanHost, "]") {
-			cleanHost = cleanHost[1 : len(cleanHost)-1]
-		}
-
-		// ── Step 3：物理判定 ────────────────────────────────────────────────────
-		if net.ParseIP(cleanHost) != nil {
-			// 情形 A：节点是纯 IP（含 IPv4 / IPv6）
-			// Backend.IP 设为裸 IP（已剥离括号），dialZeusWebSocket 直连此地址。
-			// Port 保留用户显式指定的值（可为空，空时由 dialZeusWebSocket 取 sniPort）。
-			n.Backends = append(n.Backends, Backend{IP: cleanHost, Port: port, Weight: 1})
-		} else {
-			// 情形 B：节点是纯域名（如 6523.pages.dev、worker.example.com）
-			// Backend.IP 必须留空！connectNanoTunnel 检测到 backend.IP == "" 时，
-			// 会将其赋值为 settings.ServerIP（用户配置的「指定 IP / 回源 IP」），
-			// 从而实现：物理连接 → ServerIP，SNI → 节点域名，两者解耦。
-			n.Backends = append(n.Backends, Backend{IP: "", Port: "", Weight: 1})
-		}
+		// 没有 # 分隔符，或 # 后为空：域名本身作为唯一 Backend
+		// 端口留空，由 dialZeusWebSocket 从 SNI 端口继承（默认443）
+		n.Backends = append(n.Backends, Backend{IP: n.Domain, Port: "", Weight: 1})
 		return n
 	}
 
-	// ── 有 # 分隔符：解析显式 Backend 列表（逻辑不变）─────────────────────────
-	// 格式：<domain>#<ip:port|weight>,<ip:port|weight>,...
-	// Backend.IP 由用户显式指定，直接解析即可，无需推断。
 	for _, e := range strings.Split(strings.TrimSpace(parts[1]), ",") {
 		e = strings.TrimSpace(e)
 		if e == "" {
@@ -905,6 +814,8 @@ func parseOutbounds() {
 			continue
 		}
 
+		// 统一所有分隔符为换行符，再按行切分
+		// 客户端通过 EscapeJson 将 \n 转义写入JSON，Go解析JSON后还原为真正换行符
 		rawPool := strings.NewReplacer(
 			"\r\n", "\n",
 			";", "\n",
@@ -1098,7 +1009,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			mode += fmt.Sprintf("+%dRules", len(routingMap))
 		}
 	}
-	log.Printf("[Core] v21.10 listening:%s mode:%s", inbound.Listen, mode)
+	log.Printf("[Core] v21.8 listening:%s mode:%s", inbound.Listen, mode)
 
 	maintenanceStopCh = make(chan struct{})
 
@@ -1315,7 +1226,7 @@ func connectNanoTunnel(target, outboundTag string, payload []byte) (*SafeWS, err
 
 		safe := &SafeWS{conn: wsConn}
 
-		if err := sendNanoHeaderV2(safe, target, payload, socks5Addr, fallback, secretKey); err != nil {
+		if err := sendNanoHeaderV2(safe, target, payload, socks5Addr, fallback); err != nil {
 			wsConn.Close()
 			return nil, &TunnelError{Stage: "send_header", Err: err}
 		}
@@ -1391,10 +1302,6 @@ func selectBackend(backends []Backend, key string) Backend {
 	return backends[0]
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 【修改对象】：xlink内核端代码.go -> dialZeusWebSocket
-// 【修复内容】：防范 Double Port 包裹导致的底层 DialTimeout 崩溃
-// ═══════════════════════════════════════════════════════════════════════════════
 func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Conn, error) {
 	sniHost, sniPort, err := net.SplitHostPort(sni)
 	if err != nil {
@@ -1416,29 +1323,9 @@ func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Co
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: sniHost},
 		HandshakeTimeout: wsHandshakeTimeout,
 	}
-
 	if backend.IP != "" {
 		dialer.NetDial = func(network, _ string) (net.Conn, error) {
-			// ★ 核心修复：安全分离与清理
-			finalHost := backend.IP
-			finalPort := dialPort
-
-			// 如果 backend.IP 已经是带端口的格式（如 [2602::1]:443 或 1.2.3.4:8443）
-			if h, p, err := net.SplitHostPort(backend.IP); err == nil {
-				finalHost = h
-				if p != "" {
-					finalPort = p
-				}
-			}
-
-			// 清理残留的中括号，防止 net.JoinHostPort 重复嵌套导致崩溃
-			cleanHost := finalHost
-			if strings.HasPrefix(cleanHost, "[") && strings.HasSuffix(cleanHost, "]") {
-				cleanHost = cleanHost[1 : len(cleanHost)-1]
-			}
-
-			targetAddr := net.JoinHostPort(cleanHost, finalPort)
-			return net.DialTimeout(network, targetAddr, wsHandshakeTimeout)
+			return net.DialTimeout(network, net.JoinHostPort(backend.IP, dialPort), wsHandshakeTimeout)
 		}
 	}
 
@@ -1452,75 +1339,44 @@ func dialZeusWebSocket(sni string, backend Backend, token string) (*websocket.Co
 	return conn, nil
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 【Watchdog】pipeDirect：双向转发 + RTT 流速看门狗（Law-50 焦油坑自救）
-//
-// 防御机制：
-//   • stallTimeout(20s)：每次 Read/Write 超时触发检查
-//   • stallMinBytes(512B)：超时周期内累计量低于阈值则判定焦油坑并强断
-// ═══════════════════════════════════════════════════════════════════════════════
 func pipeDirect(local net.Conn, ws *SafeWS, target string) {
 	var upBytes, downBytes int64
 	start := time.Now()
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// ── 下行：WS → 本地 ──
 	go func() {
 		defer wg.Done()
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
-
-		var accumulated int64
-
 		for {
-			local.SetWriteDeadline(time.Now().Add(stallTimeout))
-
 			mt, r, err := ws.NextReader()
 			if err != nil {
 				log.Printf("[Pipe] downstream closed target:%s err:%v", target, err)
 				break
 			}
 			if mt == websocket.BinaryMessage {
-				n, copyErr := io.CopyBuffer(local, r, buf)
+				n, err := io.CopyBuffer(local, r, buf)
 				if n > 0 {
 					atomic.AddInt64(&downBytes, n)
-					accumulated += n
 				}
-				if copyErr != nil {
-					if netErr, ok := copyErr.(net.Error); ok && netErr.Timeout() {
-						if accumulated < stallMinBytes {
-							log.Printf("[Watchdog] 下行焦油坑 target:%s 周期流量:%d < %d，强断自救",
-								target, accumulated, stallMinBytes)
-							break
-						}
-						accumulated = 0
-						continue
-					}
-					log.Printf("[Pipe] downstream copy failed target:%s err:%v", target, copyErr)
+				if err != nil {
+					log.Printf("[Pipe] downstream copy failed target:%s err:%v", target, err)
 					break
 				}
 			}
 		}
-		local.SetWriteDeadline(time.Time{})
 		local.Close()
 	}()
 
-	// ── 上行：本地 → WS ──
 	go func() {
 		defer wg.Done()
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
-
-		var accumulated int64
-
 		for {
-			local.SetReadDeadline(time.Now().Add(stallTimeout))
-
 			n, err := local.Read(buf)
 			if n > 0 {
 				atomic.AddInt64(&upBytes, int64(n))
-				accumulated += int64(n)
 				werr := ws.WriteMessage(websocket.BinaryMessage, buf[:n])
 				if werr != nil {
 					log.Printf("[Pipe] upstream write failed target:%s err:%v", target, werr)
@@ -1528,20 +1384,10 @@ func pipeDirect(local net.Conn, ws *SafeWS, target string) {
 				}
 			}
 			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					if accumulated < stallMinBytes {
-						log.Printf("[Watchdog] 上行焦油坑 target:%s 周期流量:%d < %d，强断自救",
-							target, accumulated, stallMinBytes)
-						break
-					}
-					accumulated = 0
-					continue
-				}
 				log.Printf("[Pipe] upstream read closed target:%s err:%v", target, err)
 				break
 			}
 		}
-		local.SetReadDeadline(time.Time{})
 		ws.Close()
 	}()
 
@@ -1564,15 +1410,7 @@ func formatBytes(b int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 【sendNanoHeaderV2】：构造并发送协议控制头（含 XOR 混淆层）
-//
-// 协议格式（明文）：
-//   [hostLen:1B][host:hostLen][port:2B BE][s5Len:1B][s5:s5Len][fbLen:1B][fb:fbLen]
-// 线上格式：
-//   XOR 混淆后的控制头 + 原始 payload（明文直接拼接）
-// ═══════════════════════════════════════════════════════════════════════════════
-func sendNanoHeaderV2(wsConn *SafeWS, target string, payload []byte, s5, fb string, token string) error {
+func sendNanoHeaderV2(wsConn *SafeWS, target string, payload []byte, s5, fb string) error {
 	host, portStr, _ := net.SplitHostPort(target)
 
 	portVal, err := strconv.ParseUint(portStr, 10, 16)
@@ -1590,33 +1428,25 @@ func sendNanoHeaderV2(wsConn *SafeWS, target string, payload []byte, s5, fb stri
 		return errors.New("field length exceeds 255 bytes")
 	}
 
-	// 构造明文协议控制头
-	headerBuf := new(bytes.Buffer)
-	headerBuf.WriteByte(byte(len(hb)))
-	headerBuf.Write(hb)
+	buf := new(bytes.Buffer)
+	buf.WriteByte(byte(len(hb)))
+	buf.Write(hb)
 	pb := make([]byte, 2)
 	binary.BigEndian.PutUint16(pb, port)
-	headerBuf.Write(pb)
-	headerBuf.WriteByte(byte(len(s5b)))
+	buf.Write(pb)
+	buf.WriteByte(byte(len(s5b)))
 	if len(s5b) > 0 {
-		headerBuf.Write(s5b)
+		buf.Write(s5b)
 	}
-	headerBuf.WriteByte(byte(len(fbb)))
+	buf.WriteByte(byte(len(fbb)))
 	if len(fbb) > 0 {
-		headerBuf.Write(fbb)
+		buf.Write(fbb)
 	}
-
-	// 对协议控制头实施一阶滚动 XOR 混淆（RE-28）
-	obfuscatedHeader := xorObfuscate(headerBuf.Bytes(), token)
-
-	// 混淆头 + 原始 payload 拼合后一次性发送
-	finalBuf := new(bytes.Buffer)
-	finalBuf.Write(obfuscatedHeader)
 	if len(payload) > 0 {
-		finalBuf.Write(payload)
+		buf.Write(payload)
 	}
 
-	return wsConn.WriteMessage(websocket.BinaryMessage, finalBuf.Bytes())
+	return wsConn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
 }
 
 func handleSOCKS5(conn net.Conn, _ string) (string, error) {
