@@ -1,7 +1,9 @@
 
 
-// core/core-binary.go (v13.1内核代码)
 
+// core/core-binary.go (v13.1内核代码)
+// [修复] 规则解析器：兼容 '|' (C客户端传参符)、';' (分号)、换行符
+// [修复] 域名清洗：自动去除规则末尾多余的标点符号
 
 //go:build binary
 // +build binary
@@ -262,6 +264,11 @@ func dialCleanWebSocket(serverAddr, serverIP, token string) (*websocket.Conn, er
 }
 
 func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAddr, listenAddr, strategy, rules string) string {
+	// 物理清洗：强制剔除可能存在的换行符、回车符和空格，防止 getaddrinfow 崩溃
+	cleanListen := strings.ReplaceAll(listenAddr, "\r", "")
+	cleanListen = strings.ReplaceAll(cleanListen, "\n", "")
+	cleanListen = strings.TrimSpace(cleanListen)
+
 	token := secretKey
 	if fallbackAddr != "" { token += "|" + fallbackAddr }
 
@@ -333,6 +340,8 @@ func pipeDirect(local net.Conn, ws *websocket.Conn) {
 		if err != nil { break }
 	} 
 }
+
+
 func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 string, fb string) error {
 	host, portStr, _ := net.SplitHostPort(target)
 	var port uint16
@@ -379,12 +388,5 @@ func parseServerAddr(addr string) (host, port, path string, err error) {
 	if err != nil { host = addr; port = "443"; err = nil }
 	return 
 }
-
-
-
-
-
-
-
 
 
