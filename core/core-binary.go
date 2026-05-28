@@ -1,7 +1,6 @@
 
 
 
-
 // core/core-binary.go (v13.1内核代码)
 // [修复] 规则解析器：兼容 '|' (C客户端传参符)、';' (分号)、换行符
 // [修复] 域名清洗：自动去除规则末尾多余的标点符号
@@ -238,6 +237,12 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 
 func dialCleanWebSocket(serverAddr, serverIP, token string) (*websocket.Conn, error) {
 	host, port, path, _ := parseServerAddr(serverAddr)
+	
+	// 核心修复：如果解析出的 host 包含冒号（IPv6）且不含 [ 中括号，必须在内存中强制补齐，防止 wss 链接解析崩溃 [2]
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	
 	wsURL := fmt.Sprintf("wss://%s:%s%s?token=%s", host, port, path, url.QueryEscape(token))
 	
 	requestHeader := http.Header{}
@@ -389,6 +394,7 @@ func parseServerAddr(addr string) (host, port, path string, err error) {
 	if err != nil { host = addr; port = "443"; err = nil }
 	return 
 }
+
 
 
 
