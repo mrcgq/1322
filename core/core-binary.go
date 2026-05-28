@@ -1,6 +1,7 @@
 
 
 
+
 // core/core-binary.go (v13.1内核代码)
 // [修复] 规则解析器：兼容 '|' (C客户端传参符)、';' (分号)、换行符
 // [修复] 域名清洗：自动去除规则末尾多余的标点符号
@@ -308,7 +309,7 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAdd
 				%s,
 				"server_ip": "%s",
 				"token": "%s",
-				"rules": %s`, listenAddr, serverJSON, serverIP, token, string(rulesJSON))
+				"rules": %s`, cleanListen, serverJSON, serverIP, token, string(rulesJSON)) // 修正：改用已剥离 \r 污染的 cleanListen 变量 [2]
 
 	if socks5Addr != "" {
 		config += fmt.Sprintf(`, "proxy_settings": {"socks5_address": "%s"}`, socks5Addr)
@@ -388,5 +389,6 @@ func parseServerAddr(addr string) (host, port, path string, err error) {
 	if err != nil { host = addr; port = "443"; err = nil }
 	return 
 }
+
 
 
