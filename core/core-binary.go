@@ -1,4 +1,6 @@
 
+
+
 //新xlink内核端代码
 
 
@@ -137,7 +139,7 @@ type SniffingConfig struct {
 }
 
 var defaultDNSConfig = DNSConfig{
-	Enabled:          true,
+	Enabled:          false,
 	Strategy:         DNSStrategyPreferIPv4,
 	Servers:          []string{"https://223.5.5.5/dns-query", "https://dns.google/dns-query"},
 	FallbackToRemote: true,
@@ -146,7 +148,7 @@ var defaultDNSConfig = DNSConfig{
 }
 
 var defaultSniffingConfig = SniffingConfig{
-	Enabled:      true,
+	Enabled:      false,
 	DestOverride: []string{"http", "tls"},
 	RouteOnly:    false,
 }
@@ -1518,3 +1520,8 @@ func handleHTTP(conn net.Conn, initialData []byte, _ string) (string, []byte, co
 	req.WriteProxy(&buf)
 	return target, buf.Bytes(), modeHTTPPlain, nil
 }
+
+
+
+
+
