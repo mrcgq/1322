@@ -1,1 +1,40 @@
-1
+name: Build X-Link Kernels
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-kernels:
+    name: Build Windows Kernels
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Download Go Modules
+      run: |
+        go mod tidy
+        go mod download
+
+    - name: Build Unified Binary Kernel
+      run: |
+        echo "Building Unified Kernel for Windows (amd64)..."
+        GOOS=windows GOARCH=amd64 go build \
+          -tags binary \
+          -ldflags="-s -w" \
+          -o ./cmd/xlink-cli/xlink-cli-binary.exe \
+          ./cmd/xlink-cli/
+
+    - name: Upload Binary Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: xlink-cli-binary-windows
+        path: ./cmd/xlink-cli/xlink-cli-binary.exe
