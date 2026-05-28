@@ -1,3 +1,5 @@
+
+
 package main
 
 import (
@@ -6,10 +8,13 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"github.com/mrcgq/xy/core" // 请根据您的 go.mod 实际模块路径调整此导入（如为 1322 则使用该路径）
+	"github.com/mrcgq/xy/core" 
 )
 
 func main() {
+	// 核心修复：强制开启纯 Go DNS/端口解析器，彻底绕过 Windows 损坏的 getaddrinfow 接口
+	os.Setenv("GODEBUG", "netdns=go")
+
 	serverAddr := flag.String("server", "", "Server address (single or pool separated by ';')")
 	serverIP := flag.String("ip", "", "Specific server IP")
 	secretKey := flag.String("key", "", "Secret key")
@@ -44,3 +49,4 @@ func main() {
 		listener.Close()
 	}
 }
+
