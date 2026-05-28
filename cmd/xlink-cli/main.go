@@ -6,7 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"https://github.com/mrcgq/1322/blob/main/go.mod" // 请根据您的 go.mod 实际模块路径调整此导入（如为 1322 则使用该路径）
+	"github.com/mrcgq/1322/blob/main/go.mod" // 请根据您的 go.mod 实际模块路径调整此导入（如为 1322 则使用该路径）
 )
 
 func main() {
