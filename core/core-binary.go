@@ -1,6 +1,20 @@
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // core/core-binary.go (v13.1内核代码)
 // [修复] 规则解析器：兼容 '|' (C客户端传参符)、';' (分号)、换行符
 // [修复] 域名清洗：自动去除规则末尾多余的标点符号
@@ -236,9 +250,56 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 }
 
 func dialCleanWebSocket(serverAddr, serverIP, token string) (*websocket.Conn, error) {
+	// ── 【物理移植】：支持自适应 SNI#IP:Port 的 Anycast 优选 IP 路由机制 ──
+	// 物理根基：url.Parse 无法解析含 # 的 wss URL，必须在建立物理 TCP 拨号时进行 IP 重定向 [2]
+	parts := strings.SplitN(serverAddr, "#", 2)
+	if len(parts) == 2 {
+		sni := strings.TrimSpace(parts[0])
+		realAddr := strings.TrimSpace(parts[1])
+
+		sniHost, sniPort, err := net.SplitHostPort(sni)
+		if err != nil {
+			sniHost = sni
+			sniPort = "443"
+		}
+
+		realIP, realPort, err := net.SplitHostPort(realAddr)
+		if err != nil {
+			realIP = realAddr
+			realPort = sniPort
+		}
+
+		// 确保生成的 wss 链接必须使用纯净的主机名与真实端口，不能包含任何 # 字符
+		wsURL := fmt.Sprintf("wss://%s:%s/?token=%s", sniHost, realPort, url.QueryEscape(token))
+
+		requestHeader := http.Header{}
+		requestHeader.Add("Host", sniHost)
+		requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+		dialer := websocket.Dialer{
+			TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: sniHost},
+			HandshakeTimeout: 5 * time.Second,
+		}
+
+		// 核心物理接管：将底层的物理 TCP 拨号，直接重定向到优选 IP (realIP) 和 您的自定义端口 (realPort) [2]
+		dialer.NetDial = func(network, addr string) (net.Conn, error) {
+			return net.DialTimeout(network, net.JoinHostPort(realIP, realPort), 5*time.Second)
+		}
+
+		conn, resp, err := dialer.Dial(wsURL, requestHeader)
+		if err != nil {
+			if resp != nil {
+				return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+			}
+			return nil, err
+		}
+		return conn, nil
+	}
+
+	// ── 兜底机制：非 SNI#IP 格式（如纯域名或纯 IP），走原版常规拨号 ──
 	host, port, path, _ := parseServerAddr(serverAddr)
 	
-	// 核心修复：如果解析出的 host 包含冒号（IPv6）且不含 [ 中括号，必须在内存中强制补齐，防止 wss 链接解析崩溃 [2]
+	// 物理修复：如果 host 包含冒号（IPv6）且不含 [ 中括号，必须在内存中强制补齐，防止 wss 链接解析崩溃 [2]
 	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
 		host = "[" + host + "]"
 	}
@@ -394,6 +455,11 @@ func parseServerAddr(addr string) (host, port, path string, err error) {
 	if err != nil { host = addr; port = "443"; err = nil }
 	return 
 }
+
+
+
+
+
 
 
 
