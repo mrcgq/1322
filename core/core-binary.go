@@ -1,6 +1,7 @@
 // core/core-binary.go (v14.1内核端)
 // [修复 BUG-4] ProxySettings 新增独立 FallbackAddr 字段，彻底消除 | 污染 token 的问题
 // [修复 BUG-5] dialCleanWebSocket 构建 wss URL 时携带 ?pyip= 参数，激活服务端级别二中转
+// [修复 IPv6] dialCleanWebSocket 常规路径修正 TLS ServerName 和 Host 头含方括号的问题
 
 //go:build binary
 // +build binary
@@ -334,6 +335,14 @@ func dialCleanWebSocket(serverAddr, serverIP, fallbackAddr, token string) (*webs
 
 	// ── 常规拨号（纯域名或纯 IP）──
 	host, port, path, _ := parseServerAddr(serverAddr)
+
+	// [修复 IPv6] 用于 TLS SNI 和 Host 头：必须去掉方括号
+	tlsHost := host
+	if strings.HasPrefix(tlsHost, "[") && strings.HasSuffix(tlsHost, "]") {
+		tlsHost = tlsHost[1 : len(tlsHost)-1]
+	}
+
+	// [修复 IPv6] 用于 URL 拼接：IPv6 需要方括号
 	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
 		host = "[" + host + "]"
 	}
@@ -342,11 +351,11 @@ func dialCleanWebSocket(serverAddr, serverIP, fallbackAddr, token string) (*webs
 	wsURL := buildWsURL(host+path, port, token, fallbackAddr)
 
 	requestHeader := http.Header{}
-	requestHeader.Add("Host", host)
+	requestHeader.Add("Host", tlsHost) // 无括号
 	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 	dialer := websocket.Dialer{
-		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: host},
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: tlsHost}, // 无括号
 		HandshakeTimeout: 5 * time.Second,
 	}
 
