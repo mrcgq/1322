@@ -1,13 +1,9 @@
-
-
 // core/core-binary.go
-// Xlink Kernel v15.0 (Lean Edition)
-// 精简方向：
-//   - Nano协议头移除s5字段（服务端从未使用）
-//   - 负载策略只保留Random（覆盖95%场景，彻底删除RR/Hash）
-//   - ProxyForwarderSettings（SOCKS5转发器）整体删除
-//   - GenerateConfigJSON全字段改用json.Marshal转义，杜绝裸插崩溃
-//   - FallbackAddr维持v14.1独立字段设计，不再污染token
+// Xlink Kernel v15.1 (Lean Edition)
+// 修复：
+//   - hostLen校验统一为253（与Worker/Snippets对齐）
+//   - port解析改strconv，错误明确返回
+//   - handleSOCKS5正确跳过METHODS字节（修复协议解析bug）
 
 //go:build binary
 // +build binary
@@ -28,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -83,7 +80,7 @@ var (
 	routingMap       []Rule
 )
 
-// 32KB buffer池，pipeDirect热路径复用，零内存抖动
+// 32KB buffer池，pipeDirect热路径复用
 var bufPool = sync.Pool{
 	New: func() interface{} { return make([]byte, 32*1024) },
 }
@@ -112,7 +109,6 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 		return nil, err
 	}
 
-	// 启动日志
 	mode := "Single Node"
 	if len(globalConfig.Outbounds) > 0 {
 		var s ProxySettings
@@ -127,7 +123,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			mode += "+Fallback"
 		}
 	}
-	log.Printf("[Core] Xlink Lean Engine v15.0 Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Lean Engine v15.1 Listening on %s [%s]", inbound.Listen, mode)
 
 	go func() {
 		for {
@@ -156,7 +152,6 @@ func parseRules() {
 		return
 	}
 
-	// 统一分隔符：管道符/分号/换行都视为规则分隔
 	raw := strings.ReplaceAll(s.Rules, "|", "\n")
 	raw = strings.ReplaceAll(raw, ";", "\n")
 	raw = strings.ReplaceAll(raw, "；", "\n")
@@ -167,7 +162,6 @@ func parseRules() {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// 兼容中文逗号
 		line = strings.ReplaceAll(line, "，", ",")
 		parts := strings.SplitN(line, ",", 2)
 		if len(parts) != 2 {
@@ -224,7 +218,6 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 		return
 	}
 
-	// 回应握手
 	if mode == 1 {
 		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	}
@@ -232,7 +225,6 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	}
 
-	// 热路径：双向管道，goroutine接管后本函数退出
 	pipeDirect(conn, wsConn)
 }
 
@@ -242,11 +234,9 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 		return nil, errors.New("outbound settings not found")
 	}
 
-	// 选择目标节点
 	targetServer := ""
 	logMsg := ""
 
-	// 1. 规则匹配（优先）
 	for _, rule := range routingMap {
 		if strings.Contains(target, rule.Keyword) {
 			targetServer = rule.Node
@@ -255,7 +245,6 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 		}
 	}
 
-	// 2. 负载均衡兜底（只保留Random，够用且最稳定）
 	if targetServer == "" {
 		if len(settings.ServerPool) > 0 {
 			targetServer = settings.ServerPool[rand.Intn(len(settings.ServerPool))]
@@ -273,9 +262,7 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 		return nil, err
 	}
 
-	// 发送Nano协议头（无s5字段）
-	err = sendNanoHeader(wsConn, target, payload, settings.FallbackAddr)
-	if err != nil {
+	if err = sendNanoHeader(wsConn, target, payload, settings.FallbackAddr); err != nil {
 		wsConn.Close()
 		return nil, err
 	}
@@ -286,7 +273,6 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 // ======================== WebSocket拨号 ========================
 
 func dialCleanWebSocket(serverAddr, serverIP, token, fallbackAddr string) (*websocket.Conn, error) {
-	// SNI#IP格式：Anycast优选IP路由
 	parts := strings.SplitN(serverAddr, "#", 2)
 	if len(parts) == 2 {
 		sni := strings.TrimSpace(parts[0])
@@ -328,15 +314,12 @@ func dialCleanWebSocket(serverAddr, serverIP, token, fallbackAddr string) (*webs
 		return conn, nil
 	}
 
-	// 常规拨号（纯域名或纯IP）
 	host, port, path, _ := parseServerAddr(serverAddr)
 
-	// TLS SNI不能含方括号
 	tlsHost := host
 	if strings.HasPrefix(tlsHost, "[") && strings.HasSuffix(tlsHost, "]") {
 		tlsHost = tlsHost[1 : len(tlsHost)-1]
 	}
-	// URL拼接时IPv6需要方括号
 	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
 		host = "[" + host + "]"
 	}
@@ -369,7 +352,6 @@ func dialCleanWebSocket(serverAddr, serverIP, token, fallbackAddr string) (*webs
 	return conn, nil
 }
 
-// buildWsURL：fallbackAddr非空时附加?pyip=激活服务端三级兜底
 func buildWsURL(hostWithPath, port, token, fallbackAddr string) string {
 	host := hostWithPath
 	path := "/"
@@ -386,15 +368,11 @@ func buildWsURL(hostWithPath, port, token, fallbackAddr string) string {
 
 // ======================== 配置生成 ========================
 
-// GenerateConfigJSON 在内存中生成配置，不落盘。
-// 所有用户输入字段统一用json.Marshal转义，防止特殊字符破坏JSON结构。
 func GenerateConfigJSON(serverAddr, serverIP, secretKey, fallbackAddr, listenAddr, rules string) string {
-	// 清洗监听地址
 	cleanListen := strings.TrimSpace(
 		strings.ReplaceAll(strings.ReplaceAll(listenAddr, "\r", ""), "\n", ""),
 	)
 
-	// 服务器地址池处理
 	normalized := serverAddr
 	for _, sep := range []string{"\r\n", "\n", "，", ",", "；"} {
 		normalized = strings.ReplaceAll(normalized, sep, ";")
@@ -418,7 +396,6 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, fallbackAddr, listenAdd
 		default:
 			poolJSON, _ := json.Marshal(validPool)
 			firstJSON, _ := json.Marshal(validPool[0])
-			// 只保留Random策略，不再传入strategy参数
 			serverJSON = fmt.Sprintf(`"server":%s,"server_pool":%s,"strategy":"random"`,
 				string(firstJSON), string(poolJSON))
 		}
@@ -455,12 +432,10 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, fallbackAddr, listenAdd
 
 // ======================== 辅助函数 ========================
 
-// pipeDirect：传输热路径，goroutine+bufPool，JS退场模型的Go等价实现
 func pipeDirect(local net.Conn, ws *websocket.Conn) {
 	defer ws.Close()
 	defer local.Close()
 
-	// 下行：WS → Local
 	go func() {
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
@@ -478,7 +453,6 @@ func pipeDirect(local net.Conn, ws *websocket.Conn) {
 		local.Close()
 	}()
 
-	// 上行：Local → WS
 	buf := bufPool.Get().([]byte)
 	defer bufPool.Put(buf)
 	for {
@@ -494,43 +468,42 @@ func pipeDirect(local net.Conn, ws *websocket.Conn) {
 	}
 }
 
-// sendNanoHeader：精简版Nano协议头，移除s5字段
-//
-// 帧格式（二进制，大端序）：
-// ┌─────────┬──────┬──────┬─────────┬──────┬─────────┐
-// │hostLen  │host  │port  │fbLen    │fb    │payload  │
-// │1 byte   │N byte│2byte │1 byte   │M byte│...      │
-// └─────────┴──────┴──────┴─────────┴──────┴─────────┘
+// sendNanoHeader：Nano协议头
+// 帧格式：hostLen(1)|host(N)|port(2,大端)|fbLen(1)|fb(M)|payload
 func sendNanoHeader(wsConn *websocket.Conn, target string, payload []byte, fb string) error {
-	host, portStr, _ := net.SplitHostPort(target)
-	var port uint16
-	fmt.Sscanf(portStr, "%d", &port)
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		return fmt.Errorf("invalid target %q: %w", target, err)
+	}
+
+	// 修复：用strconv替代fmt.Sscanf，错误明确返回
+	portNum, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil || portNum == 0 {
+		return fmt.Errorf("invalid port %q", portStr)
+	}
 
 	hostBytes := []byte(host)
 	fbBytes := []byte(fb)
 
-	if len(hostBytes) > 255 || len(fbBytes) > 255 {
-		return errors.New("address length exceeds 255 bytes")
+	// 修复：统一为253，与Worker/Snippets对齐
+	if len(hostBytes) > 253 || len(fbBytes) > 253 {
+		return errors.New("address length exceeds 253 bytes")
 	}
 
 	buf := new(bytes.Buffer)
 
-	// host
 	buf.WriteByte(byte(len(hostBytes)))
 	buf.Write(hostBytes)
 
-	// port（大端序uint16）
 	portBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(portBytes, port)
+	binary.BigEndian.PutUint16(portBytes, uint16(portNum))
 	buf.Write(portBytes)
 
-	// fb
 	buf.WriteByte(byte(len(fbBytes)))
 	if len(fbBytes) > 0 {
 		buf.Write(fbBytes)
 	}
 
-	// payload（Early Data）
 	if len(payload) > 0 {
 		buf.Write(payload)
 	}
@@ -538,34 +511,63 @@ func sendNanoHeader(wsConn *websocket.Conn, target string, payload []byte, fb st
 	return wsConn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
 }
 
+// handleSOCKS5：修复METHODS字节跳过bug
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
-	handshakeBuf := make([]byte, 2)
-	io.ReadFull(conn, handshakeBuf)
-	conn.Write([]byte{0x05, 0x00})
+	// 读 VER + NMETHODS
+	meta := make([]byte, 2)
+	if _, err := io.ReadFull(conn, meta); err != nil {
+		return "", err
+	}
+	// 跳过 NMETHODS 个 METHOD 字节，否则后续读取错位
+	if meta[1] > 0 {
+		methods := make([]byte, meta[1])
+		if _, err := io.ReadFull(conn, methods); err != nil {
+			return "", err
+		}
+	}
+	// 回应：选择无需认证
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+		return "", err
+	}
 
+	// 读请求头：VER CMD RSV ATYP
 	header := make([]byte, 4)
-	io.ReadFull(conn, header)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return "", err
+	}
 
 	var host string
 	switch header[3] {
-	case 1:
+	case 1: // IPv4
 		b := make([]byte, 4)
-		io.ReadFull(conn, b)
+		if _, err := io.ReadFull(conn, b); err != nil {
+			return "", err
+		}
 		host = net.IP(b).String()
-	case 3:
+	case 3: // 域名
 		b := make([]byte, 1)
-		io.ReadFull(conn, b)
+		if _, err := io.ReadFull(conn, b); err != nil {
+			return "", err
+		}
 		d := make([]byte, b[0])
-		io.ReadFull(conn, d)
+		if _, err := io.ReadFull(conn, d); err != nil {
+			return "", err
+		}
 		host = string(d)
-	case 4:
+	case 4: // IPv6
 		b := make([]byte, 16)
-		io.ReadFull(conn, b)
+		if _, err := io.ReadFull(conn, b); err != nil {
+			return "", err
+		}
 		host = net.IP(b).String()
+	default:
+		return "", fmt.Errorf("unsupported SOCKS5 ATYP: %d", header[3])
 	}
 
 	portBytes := make([]byte, 2)
-	io.ReadFull(conn, portBytes)
+	if _, err := io.ReadFull(conn, portBytes); err != nil {
+		return "", err
+	}
 	port := binary.BigEndian.Uint16(portBytes)
 	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
 }
@@ -609,6 +611,3 @@ func parseServerAddr(addr string) (host, port, path string, err error) {
 	}
 	return
 }
-
-
-
