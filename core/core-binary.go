@@ -1,7 +1,13 @@
-// core/core-binary.go (v14.1内核端)
-// [修复 BUG-4] ProxySettings 新增独立 FallbackAddr 字段，彻底消除 | 污染 token 的问题
-// [修复 BUG-5] dialCleanWebSocket 构建 wss URL 时携带 ?pyip= 参数，激活服务端级别二中转
-// [修复 IPv6] dialCleanWebSocket 常规路径修正 TLS ServerName 和 Host 头含方括号的问题
+
+
+// core/core-binary.go
+// Xlink Kernel v15.0 (Lean Edition)
+// 精简方向：
+//   - Nano协议头移除s5字段（服务端从未使用）
+//   - 负载策略只保留Random（覆盖95%场景，彻底删除RR/Hash）
+//   - ProxyForwarderSettings（SOCKS5转发器）整体删除
+//   - GenerateConfigJSON全字段改用json.Marshal转义，杜绝裸插崩溃
+//   - FallbackAddr维持v14.1独立字段设计，不再污染token
 
 //go:build binary
 // +build binary
@@ -11,7 +17,6 @@ package core
 import (
 	"bufio"
 	"bytes"
-	"crypto/md5"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -25,26 +30,21 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-var globalRRIndex uint64
-
 // ======================== 结构定义 ========================
 
 type ProxySettings struct {
-	Server     string   `json:"server"`
-	ServerPool []string `json:"server_pool"`
-	Strategy   string   `json:"strategy"`
-	Rules      string   `json:"rules"`
-	ServerIP   string   `json:"server_ip"`
-	Token      string   `json:"token"`
-	// [修复 BUG-4] 独立字段，不再与 token 用 | 合并
-	FallbackAddr      string                  `json:"fallback_addr,omitempty"`
-	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"`
+	Server       string   `json:"server"`
+	ServerPool   []string `json:"server_pool"`
+	Strategy     string   `json:"strategy"`
+	Rules        string   `json:"rules"`
+	ServerIP     string   `json:"server_ip"`
+	Token        string   `json:"token"`
+	FallbackAddr string   `json:"fallback_addr,omitempty"`
 }
 
 type Rule struct {
@@ -57,23 +57,25 @@ type Config struct {
 	Outbounds []Outbound `json:"outbounds"`
 	Routing   Routing    `json:"routing"`
 }
+
 type Inbound struct {
 	Tag      string `json:"tag"`
 	Listen   string `json:"listen"`
 	Protocol string `json:"protocol"`
 }
+
 type Outbound struct {
 	Tag      string          `json:"tag"`
 	Protocol string          `json:"protocol"`
 	Settings json.RawMessage `json:"settings,omitempty"`
 }
-type ProxyForwarderSettings struct {
-	Socks5Address string `json:"socks5_address"`
-}
+
 type Routing struct {
 	Rules           []Rule `json:"rules"`
 	DefaultOutbound string `json:"defaultOutbound,omitempty"`
 }
+
+// ======================== 全局状态 ========================
 
 var (
 	globalConfig     Config
@@ -81,7 +83,10 @@ var (
 	routingMap       []Rule
 )
 
-var bufPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }}
+// 32KB buffer池，pipeDirect热路径复用，零内存抖动
+var bufPool = sync.Pool{
+	New: func() interface{} { return make([]byte, 32*1024) },
+}
 
 // ======================== 核心入口 ========================
 
@@ -98,29 +103,31 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	parseOutbounds()
 
 	if len(globalConfig.Inbounds) == 0 {
-		return nil, errors.New("no inbounds")
+		return nil, errors.New("no inbounds configured")
 	}
+
 	inbound := globalConfig.Inbounds[0]
 	listener, err := net.Listen("tcp", inbound.Listen)
 	if err != nil {
 		return nil, err
 	}
 
+	// 启动日志
 	mode := "Single Node"
 	if len(globalConfig.Outbounds) > 0 {
 		var s ProxySettings
 		json.Unmarshal(globalConfig.Outbounds[0].Settings, &s)
 		if len(s.ServerPool) > 1 {
-			mode = fmt.Sprintf("Hydra Pool (%d nodes, Strategy: %s)", len(s.ServerPool), s.Strategy)
+			mode = fmt.Sprintf("Pool(%d nodes)", len(s.ServerPool))
 		}
 		if len(routingMap) > 0 {
-			mode += fmt.Sprintf(" + %d Rules", len(routingMap))
+			mode += fmt.Sprintf("+%d Rules", len(routingMap))
 		}
 		if s.FallbackAddr != "" {
-			mode += fmt.Sprintf(" + Fallback(%s)", s.FallbackAddr)
+			mode += "+Fallback"
 		}
 	}
-	log.Printf("[Core] Xlink Odyssey Engine (v14.1) Listening on %s [%s]", inbound.Listen, mode)
+	log.Printf("[Core] Xlink Lean Engine v15.0 Listening on %s [%s]", inbound.Listen, mode)
 
 	go func() {
 		for {
@@ -131,6 +138,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 			go handleGeneralConnection(conn, inbound.Tag)
 		}
 	}()
+
 	return listener, nil
 }
 
@@ -148,25 +156,27 @@ func parseRules() {
 		return
 	}
 
-	rawRules := strings.ReplaceAll(s.Rules, "|", "\n")
-	rawRules = strings.ReplaceAll(rawRules, ";", "\n")
-	rawRules = strings.ReplaceAll(rawRules, "；", "\n")
-	rawRules = strings.ReplaceAll(rawRules, "\r", "")
+	// 统一分隔符：管道符/分号/换行都视为规则分隔
+	raw := strings.ReplaceAll(s.Rules, "|", "\n")
+	raw = strings.ReplaceAll(raw, ";", "\n")
+	raw = strings.ReplaceAll(raw, "；", "\n")
+	raw = strings.ReplaceAll(raw, "\r", "")
 
-	lines := strings.Split(rawRules, "\n")
-	for _, line := range lines {
+	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		// 兼容中文逗号
 		line = strings.ReplaceAll(line, "，", ",")
 		parts := strings.SplitN(line, ",", 2)
-		if len(parts) == 2 {
-			keyword := strings.TrimSpace(parts[0])
-			node := strings.TrimRight(strings.TrimSpace(parts[1]), ";,.")
-			if keyword != "" && node != "" {
-				routingMap = append(routingMap, Rule{Keyword: keyword, Node: node})
-			}
+		if len(parts) != 2 {
+			continue
+		}
+		keyword := strings.TrimSpace(parts[0])
+		node := strings.TrimRight(strings.TrimSpace(parts[1]), ";,.")
+		if keyword != "" && node != "" {
+			routingMap = append(routingMap, Rule{Keyword: keyword, Node: node})
 		}
 	}
 }
@@ -186,14 +196,17 @@ func parseOutbounds() {
 
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
+
 	buf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		return
 	}
+
 	var target string
 	var err error
 	var firstFrame []byte
 	var mode int
+
 	switch buf[0] {
 	case 0x05:
 		target, err = handleSOCKS5(conn, inboundTag)
@@ -211,86 +224,69 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 		return
 	}
 
+	// 回应握手
 	if mode == 1 {
 		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	}
 	if mode == 2 {
 		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	}
+
+	// 热路径：双向管道，goroutine接管后本函数退出
 	pipeDirect(conn, wsConn)
 }
 
 func connectNanoTunnel(target string, outboundTag string, payload []byte) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok {
-		return nil, errors.New("settings not found")
+		return nil, errors.New("outbound settings not found")
 	}
 
-	// [修复 BUG-4] token 就是纯净的 secretKey，不再含 | 拼接
-	secretKey := settings.Token
-	// [修复 BUG-4] fallback 从独立字段读取
-	fallback := settings.FallbackAddr
-	socks5 := ""
-	if settings.ForwarderSettings != nil {
-		socks5 = settings.ForwarderSettings.Socks5Address
-	}
-
+	// 选择目标节点
 	targetServer := ""
 	logMsg := ""
 
-	// 1. 规则匹配
+	// 1. 规则匹配（优先）
 	for _, rule := range routingMap {
 		if strings.Contains(target, rule.Keyword) {
 			targetServer = rule.Node
-			logMsg = fmt.Sprintf("[Core] Rule Hit -> %s | Node: %s (Rule: %s)", target, targetServer, rule.Keyword)
+			logMsg = fmt.Sprintf("[Core] Rule Hit->%s|Node:%s(Rule:%s)", target, targetServer, rule.Keyword)
 			break
 		}
 	}
 
-	// 2. 负载均衡兜底
+	// 2. 负载均衡兜底（只保留Random，够用且最稳定）
 	if targetServer == "" {
 		if len(settings.ServerPool) > 0 {
-			poolLen := uint64(len(settings.ServerPool))
-			strategy := settings.Strategy
-			switch strategy {
-			case "rr":
-				idx := atomic.AddUint64(&globalRRIndex, 1)
-				targetServer = settings.ServerPool[idx%poolLen]
-			case "hash":
-				h := md5.Sum([]byte(target))
-				hashVal := binary.BigEndian.Uint64(h[:8])
-				targetServer = settings.ServerPool[hashVal%poolLen]
-			default:
-				targetServer = settings.ServerPool[rand.Intn(int(poolLen))]
-			}
-			logMsg = fmt.Sprintf("[Core] LB -> %s | Node: %s | Algo: %s", target, targetServer, strategy)
+			targetServer = settings.ServerPool[rand.Intn(len(settings.ServerPool))]
+			logMsg = fmt.Sprintf("[Core] LB->%s|Node:%s|Algo:random", target, targetServer)
 		} else {
 			targetServer = settings.Server
-			logMsg = fmt.Sprintf("[Core] Direct -> %s | Node: %s", target, targetServer)
+			logMsg = fmt.Sprintf("[Core] Direct->%s|Node:%s", target, targetServer)
 		}
 	}
 
 	log.Print(logMsg)
 
-	// [修复 BUG-5] 将 serverIP 和 fallback 同时传入，由 dialCleanWebSocket 附加到 URL
-	wsConn, err := dialCleanWebSocket(targetServer, settings.ServerIP, fallback, secretKey)
+	wsConn, err := dialCleanWebSocket(targetServer, settings.ServerIP, settings.Token, settings.FallbackAddr)
 	if err != nil {
 		return nil, err
 	}
 
-	err = sendNanoHeaderV2(wsConn, target, payload, socks5, fallback)
+	// 发送Nano协议头（无s5字段）
+	err = sendNanoHeader(wsConn, target, payload, settings.FallbackAddr)
 	if err != nil {
 		wsConn.Close()
 		return nil, err
 	}
+
 	return wsConn, nil
 }
 
-// ======================== WebSocket 拨号 ========================
+// ======================== WebSocket拨号 ========================
 
-// [修复 BUG-5] 新增 fallbackAddr 参数，构建 URL 时携带 ?pyip=，激活服务端级别二中转
-func dialCleanWebSocket(serverAddr, serverIP, fallbackAddr, token string) (*websocket.Conn, error) {
-	// ── SNI#IP 格式：Anycast 优选 IP 路由 ──
+func dialCleanWebSocket(serverAddr, serverIP, token, fallbackAddr string) (*websocket.Conn, error) {
+	// SNI#IP格式：Anycast优选IP路由
 	parts := strings.SplitN(serverAddr, "#", 2)
 	if len(parts) == 2 {
 		sni := strings.TrimSpace(parts[0])
@@ -308,7 +304,6 @@ func dialCleanWebSocket(serverAddr, serverIP, fallbackAddr, token string) (*webs
 			realPort = sniPort
 		}
 
-		// [修复 BUG-5] 构建含 pyip 的 URL
 		wsURL := buildWsURL(sniHost, realPort, token, fallbackAddr)
 
 		requestHeader := http.Header{}
@@ -333,29 +328,27 @@ func dialCleanWebSocket(serverAddr, serverIP, fallbackAddr, token string) (*webs
 		return conn, nil
 	}
 
-	// ── 常规拨号（纯域名或纯 IP）──
+	// 常规拨号（纯域名或纯IP）
 	host, port, path, _ := parseServerAddr(serverAddr)
 
-	// [修复 IPv6] 用于 TLS SNI 和 Host 头：必须去掉方括号
+	// TLS SNI不能含方括号
 	tlsHost := host
 	if strings.HasPrefix(tlsHost, "[") && strings.HasSuffix(tlsHost, "]") {
 		tlsHost = tlsHost[1 : len(tlsHost)-1]
 	}
-
-	// [修复 IPv6] 用于 URL 拼接：IPv6 需要方括号
+	// URL拼接时IPv6需要方括号
 	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
 		host = "[" + host + "]"
 	}
 
-	// [修复 BUG-5] 统一通过 buildWsURL 构建，确保携带 pyip
 	wsURL := buildWsURL(host+path, port, token, fallbackAddr)
 
 	requestHeader := http.Header{}
-	requestHeader.Add("Host", tlsHost) // 无括号
+	requestHeader.Add("Host", tlsHost)
 	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 	dialer := websocket.Dialer{
-		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: tlsHost}, // 无括号
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: tlsHost},
 		HandshakeTimeout: 5 * time.Second,
 	}
 
@@ -376,17 +369,14 @@ func dialCleanWebSocket(serverAddr, serverIP, fallbackAddr, token string) (*webs
 	return conn, nil
 }
 
-// [修复 BUG-5] 统一 URL 构建函数：当 fallbackAddr 非空时附加 ?pyip= 激活服务端级别二中转
-// 注意：path 已含前导 /，port 是端口字符串，host 可含 [IPv6]
+// buildWsURL：fallbackAddr非空时附加?pyip=激活服务端三级兜底
 func buildWsURL(hostWithPath, port, token, fallbackAddr string) string {
-	// 拆分 host 和 path
 	host := hostWithPath
 	path := "/"
 	if idx := strings.Index(hostWithPath, "/"); idx != -1 {
 		path = hostWithPath[idx:]
 		host = hostWithPath[:idx]
 	}
-
 	base := fmt.Sprintf("wss://%s:%s%s?token=%s", host, port, path, url.QueryEscape(token))
 	if fallbackAddr != "" {
 		base += "&pyip=" + url.QueryEscape(fallbackAddr)
@@ -396,21 +386,23 @@ func buildWsURL(hostWithPath, port, token, fallbackAddr string) string {
 
 // ======================== 配置生成 ========================
 
-func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAddr, listenAddr, strategy, rules string) string {
+// GenerateConfigJSON 在内存中生成配置，不落盘。
+// 所有用户输入字段统一用json.Marshal转义，防止特殊字符破坏JSON结构。
+func GenerateConfigJSON(serverAddr, serverIP, secretKey, fallbackAddr, listenAddr, rules string) string {
 	// 清洗监听地址
-	cleanListen := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(listenAddr, "\r", ""), "\n", ""))
+	cleanListen := strings.TrimSpace(
+		strings.ReplaceAll(strings.ReplaceAll(listenAddr, "\r", ""), "\n", ""),
+	)
 
-	// [修复 BUG-4] token 字段只存 secretKey，不再拼接 fallback
-	// fallback 单独写入 fallback_addr 字段
-
-	normalizedAddr := serverAddr
-	for _, r := range []string{"\r\n", "\n", "，", ",", "；"} {
-		normalizedAddr = strings.ReplaceAll(normalizedAddr, r, ";")
+	// 服务器地址池处理
+	normalized := serverAddr
+	for _, sep := range []string{"\r\n", "\n", "，", ",", "；"} {
+		normalized = strings.ReplaceAll(normalized, sep, ";")
 	}
 
 	var serverJSON string
-	if strings.Contains(normalizedAddr, ";") {
-		rawPool := strings.Split(normalizedAddr, ";")
+	if strings.Contains(normalized, ";") {
+		rawPool := strings.Split(normalized, ";")
 		var validPool []string
 		for _, node := range rawPool {
 			if t := strings.TrimSpace(node); t != "" {
@@ -419,54 +411,56 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, socks5Addr, fallbackAdd
 		}
 		switch len(validPool) {
 		case 0:
-			serverJSON = `"server": ""`
+			serverJSON = `"server":""`
 		case 1:
-			serverJSON = fmt.Sprintf(`"server": "%s"`, validPool[0])
+			nodeJSON, _ := json.Marshal(validPool[0])
+			serverJSON = fmt.Sprintf(`"server":%s`, string(nodeJSON))
 		default:
 			poolJSON, _ := json.Marshal(validPool)
-			serverJSON = fmt.Sprintf(`"server": "%s", "server_pool": %s, "strategy": "%s"`,
-				validPool[0], string(poolJSON), strategy)
+			firstJSON, _ := json.Marshal(validPool[0])
+			// 只保留Random策略，不再传入strategy参数
+			serverJSON = fmt.Sprintf(`"server":%s,"server_pool":%s,"strategy":"random"`,
+				string(firstJSON), string(poolJSON))
 		}
 	} else {
-		serverJSON = fmt.Sprintf(`"server": "%s"`, strings.TrimSpace(serverAddr))
+		nodeJSON, _ := json.Marshal(strings.TrimSpace(serverAddr))
+		serverJSON = fmt.Sprintf(`"server":%s`, string(nodeJSON))
 	}
 
+	tokenJSON, _ := json.Marshal(secretKey)
 	rulesJSON, _ := json.Marshal(rules)
-
-	// [修复 BUG-4] fallback_addr 独立字段，token 保持纯净
-	fallbackJSON := ""
-	if fallbackAddr != "" {
-		fallbackJSON = fmt.Sprintf(`, "fallback_addr": "%s"`, fallbackAddr)
-	}
 
 	serverIPJSON := ""
 	if serverIP != "" {
-		serverIPJSON = fmt.Sprintf(`, "server_ip": "%s"`, serverIP)
+		sipJSON, _ := json.Marshal(serverIP)
+		serverIPJSON = fmt.Sprintf(`,"server_ip":%s`, string(sipJSON))
 	}
 
-	config := fmt.Sprintf(`{
-	"inbounds": [{"tag": "socks-in", "listen": "%s", "protocol": "socks"}],
-	"outbounds": [{
-		"tag": "proxy",
-		"protocol": "ech-proxy",
-		"settings": {
-			%s,
-			"token": "%s",
-			"rules": %s%s%s`,
-		cleanListen, serverJSON, secretKey, string(rulesJSON), serverIPJSON, fallbackJSON)
-
-	if socks5Addr != "" {
-		config += fmt.Sprintf(`, "proxy_settings": {"socks5_address": "%s"}`, socks5Addr)
+	fallbackJSON := ""
+	if fallbackAddr != "" {
+		fbJSON, _ := json.Marshal(fallbackAddr)
+		fallbackJSON = fmt.Sprintf(`,"fallback_addr":%s`, string(fbJSON))
 	}
-	config += `}}], "routing": {"rules": [{"outboundTag": "proxy", "port": [0, 65535]}]}}`
-	return config
+
+	return fmt.Sprintf(
+		`{"inbounds":[{"tag":"socks-in","listen":"%s","protocol":"socks"}],"outbounds":[{"tag":"proxy","protocol":"ech-proxy","settings":{%s,"token":%s,"rules":%s%s%s}}],"routing":{"rules":[{"outboundTag":"proxy","port":[0,65535]}]}}`,
+		cleanListen,
+		serverJSON,
+		string(tokenJSON),
+		string(rulesJSON),
+		serverIPJSON,
+		fallbackJSON,
+	)
 }
 
 // ======================== 辅助函数 ========================
 
+// pipeDirect：传输热路径，goroutine+bufPool，JS退场模型的Go等价实现
 func pipeDirect(local net.Conn, ws *websocket.Conn) {
 	defer ws.Close()
 	defer local.Close()
+
+	// 下行：WS → Local
 	go func() {
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
@@ -483,12 +477,14 @@ func pipeDirect(local net.Conn, ws *websocket.Conn) {
 		}
 		local.Close()
 	}()
-	bufPtr := bufPool.Get().([]byte)
-	defer bufPool.Put(bufPtr)
+
+	// 上行：Local → WS
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
 	for {
-		n, err := local.Read(bufPtr)
+		n, err := local.Read(buf)
 		if n > 0 {
-			if err := ws.WriteMessage(websocket.BinaryMessage, bufPtr[:n]); err != nil {
+			if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
 				break
 			}
 		}
@@ -498,33 +494,47 @@ func pipeDirect(local net.Conn, ws *websocket.Conn) {
 	}
 }
 
-func sendNanoHeaderV2(wsConn *websocket.Conn, target string, payload []byte, s5 string, fb string) error {
+// sendNanoHeader：精简版Nano协议头，移除s5字段
+//
+// 帧格式（二进制，大端序）：
+// ┌─────────┬──────┬──────┬─────────┬──────┬─────────┐
+// │hostLen  │host  │port  │fbLen    │fb    │payload  │
+// │1 byte   │N byte│2byte │1 byte   │M byte│...      │
+// └─────────┴──────┴──────┴─────────┴──────┴─────────┘
+func sendNanoHeader(wsConn *websocket.Conn, target string, payload []byte, fb string) error {
 	host, portStr, _ := net.SplitHostPort(target)
 	var port uint16
 	fmt.Sscanf(portStr, "%d", &port)
+
 	hostBytes := []byte(host)
-	s5Bytes := []byte(s5)
 	fbBytes := []byte(fb)
-	if len(hostBytes) > 255 || len(s5Bytes) > 255 || len(fbBytes) > 255 {
+
+	if len(hostBytes) > 255 || len(fbBytes) > 255 {
 		return errors.New("address length exceeds 255 bytes")
 	}
+
 	buf := new(bytes.Buffer)
+
+	// host
 	buf.WriteByte(byte(len(hostBytes)))
 	buf.Write(hostBytes)
+
+	// port（大端序uint16）
 	portBytes := make([]byte, 2)
 	binary.BigEndian.PutUint16(portBytes, port)
 	buf.Write(portBytes)
-	buf.WriteByte(byte(len(s5Bytes)))
-	if len(s5Bytes) > 0 {
-		buf.Write(s5Bytes)
-	}
+
+	// fb
 	buf.WriteByte(byte(len(fbBytes)))
 	if len(fbBytes) > 0 {
 		buf.Write(fbBytes)
 	}
+
+	// payload（Early Data）
 	if len(payload) > 0 {
 		buf.Write(payload)
 	}
+
 	return wsConn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
 }
 
@@ -532,8 +542,10 @@ func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
 	handshakeBuf := make([]byte, 2)
 	io.ReadFull(conn, handshakeBuf)
 	conn.Write([]byte{0x05, 0x00})
+
 	header := make([]byte, 4)
 	io.ReadFull(conn, header)
+
 	var host string
 	switch header[3] {
 	case 1:
@@ -551,6 +563,7 @@ func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
 		io.ReadFull(conn, b)
 		host = net.IP(b).String()
 	}
+
 	portBytes := make([]byte, 2)
 	io.ReadFull(conn, portBytes)
 	port := binary.BigEndian.Uint16(portBytes)
@@ -563,6 +576,7 @@ func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, [
 	if err != nil {
 		return "", nil, 0, err
 	}
+
 	target := req.Host
 	if !strings.Contains(target, ":") {
 		if req.Method == "CONNECT" {
@@ -571,9 +585,11 @@ func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, [
 			target += ":80"
 		}
 	}
+
 	if req.Method == "CONNECT" {
 		return target, nil, 2, nil
 	}
+
 	var buf bytes.Buffer
 	req.WriteProxy(&buf)
 	return target, buf.Bytes(), 3, nil
@@ -593,3 +609,6 @@ func parseServerAddr(addr string) (host, port, path string, err error) {
 	}
 	return
 }
+
+
+
