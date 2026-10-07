@@ -1,5 +1,12 @@
+
 module github.com/mrcgq/xy
 
-go 1.21
+go 1.22
 
-require github.com/gorilla/websocket v1.5.3
+require (
+	github.com/gorilla/websocket v1.5.3
+)
+
+
+
+

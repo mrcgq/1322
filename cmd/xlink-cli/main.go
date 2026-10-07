@@ -1,16 +1,18 @@
+//文件三：main.go (Go CLI 入口)
 
 // =========================================================================================
 // main.go
-// Xlink Odyssey CLI 入口 v14.2
-// [变更] 删除 --s5 flag，移除 socks5Addr 传递
+// Xlink Odyssey CLI Entrance v14.0 (S-Tier Industrial Edition)
+// [特性] 专有 --pipe-stdin 内存流模式，彻底杜绝命令行明文泄露凭据
+// [生命周期] 支持父进程管道消亡自收敛与操作系统信号（SIGINT / SIGTERM / Break）平滑断开
 // =========================================================================================
 
 package main
 
 import (
 	"flag"
+	"io"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -19,58 +21,47 @@ import (
 )
 
 func main() {
-	// 强制使用纯 Go DNS 解析器，避免 CGO 解析器在某些系统上的问题
-	os.Setenv("GODEBUG", "netdns=go")
+	// 强制使用纯 Go DNS 解析器，消除 CGO 依赖并在 Windows 平台实现无损并发解析
+	_ = os.Setenv("GODEBUG", "netdns=go")
 
-	serverAddr  := flag.String("server",   "",                 "Server address (single or pool separated by ';')")
-	serverIP    := flag.String("ip",       "",                 "Specific server IP override")
-	secretKey   := flag.String("key",      "",                 "Secret key / token")
-	fallbackAddr := flag.String("fallback", "",                "Fallback relay IP (passed to Worker as Nano fb field + ?pyip=)")
-	listenAddr  := flag.String("listen",   "127.0.0.1:10808", "Local SOCKS5 listen address")
-	strategy    := flag.String("strategy", "random",           "Load balance strategy: random | rr | hash")
-	rules       := flag.String("rules",    "",                 "Routing rules string (keyword,node separated by '|')")
-	// --s5 flag 已删除（v14.2）
-
+	pipeMode := flag.Bool("pipe-stdin", false, "Read JSON configuration securely from STDIN stream")
 	flag.Parse()
 
-	if *serverAddr == "" {
-		log.Fatal("[CLI] Error: --server argument is required.")
+	var configJSON []byte
+	var err error
+
+	if *pipeMode {
+		// 从标准输入匿名安全流中一次性载入内存，系统进程树中 0 敏感参数暴露
+		configJSON, err = io.ReadAll(os.Stdin)
+		if err != nil || len(configJSON) == 0 {
+			core.EmitError("Stdin 管道配置流为空或读取异常")
+			os.Exit(1)
+		}
+	} else {
+		core.EmitError("错误: 传统明文 CLI 参数启动已被安全阻断，请使用 --pipe-stdin 模式")
+		log.Fatal("[Fatal] Direct CLI parameter mode is deprecated for security. Use --pipe-stdin.")
 	}
 
-	// 验证监听地址格式
-	if _, _, err := net.SplitHostPort(*listenAddr); err != nil {
-		log.Fatalf("[CLI] Error: invalid --listen address '%s': %v", *listenAddr, err)
-	}
-
-	// 生成内存配置（不含 s5）
-	configJSON := core.GenerateConfigJSON(
-		*serverAddr,
-		*serverIP,
-		*secretKey,
-		*fallbackAddr,
-		*listenAddr,
-		*strategy,
-		*rules,
-	)
-
-	log.Println("[CLI] Starting X-Link Odyssey Kernel (v14.2)...")
-	log.Printf("[CLI] Listen: %s | Strategy: %s", *listenAddr, *strategy)
-
-	listener, err := core.StartInstance([]byte(configJSON))
+	// 启动内核实例并获取监听器句柄
+	listener, err := core.StartInstance(configJSON)
 	if err != nil {
-		log.Fatalf("[CLI] Failed to start core engine: %v", err)
+		os.Exit(1)
 	}
 
-	log.Printf("[CLI] Engine running successfully on %s", *listenAddr)
-
-	// 等待系统信号优雅退出
+	// 捕获系统退出与终端中断信号
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+
+	// 阻塞等待系统中断信号
 	<-sigChan
 
-	log.Println("[CLI] Shutting down...")
+	// 触发显式平滑关闭流程
 	if listener != nil {
-		listener.Close()
+		_ = listener.Close()
 	}
-	log.Println("[CLI] Stopped.")
 }
+
+
+
+
+
