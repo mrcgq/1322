@@ -4,6 +4,7 @@
 
 
 
+
 //文件二：core/core-binary.go (Go 内核引擎 S 级完全体)
 
 // =========================================================================================
@@ -384,6 +385,74 @@ func connectNanoTunnel(target string, outboundTag string, payload []byte) (*webs
 
 // ======================== WebSocket 拨号 ========================
 
+// smartDialTCP 智能解析并连接目标（支持 IPv4/IPv6/域名/带端口格式，自动优先 IPv4 避免黑洞）
+func smartDialTCP(targetHostOrIP, defaultPort string, timeout time.Duration) (net.Conn, error) {
+	target := strings.TrimSpace(targetHostOrIP)
+	host := target
+	port := defaultPort
+
+	// 1. 拆解 host 和 port
+	if strings.HasPrefix(target, "[") {
+		if idx := strings.Index(target, "]"); idx != -1 {
+			host = target[1:idx]
+			rest := target[idx+1:]
+			if strings.HasPrefix(rest, ":") && len(rest) > 1 {
+				port = rest[1:]
+			}
+		}
+	} else if strings.Count(target, ":") == 1 {
+		if h, p, err := net.SplitHostPort(target); err == nil {
+			host = h
+			port = p
+		}
+	} else if strings.Count(target, ":") > 1 {
+		host = target
+	}
+
+	// 2. 如果本身就是 IP，直接连接
+	if ip := net.ParseIP(host); ip != nil {
+		targetAddr := net.JoinHostPort(host, port)
+		return net.DialTimeout("tcp", targetAddr, timeout)
+	}
+
+	// 3. 如果是域名 (如 cf.877774.xyz)，强制优先 IPv4 避免 IPv6 黑洞
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+	}
+
+	var sortedIPs []net.IP
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			sortedIPs = append(sortedIPs, ip)
+		}
+	}
+	for _, ip := range ips {
+		if ip.To4() == nil {
+			sortedIPs = append(sortedIPs, ip)
+		}
+	}
+
+	var lastErr error
+	singleTimeout := 3500 * time.Millisecond
+	if singleTimeout > timeout {
+		singleTimeout = timeout
+	}
+
+	for _, ip := range sortedIPs {
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip.String(), port), singleTimeout)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return net.DialTimeout("tcp", net.JoinHostPort(host, port), timeout)
+}
+
 func dialCleanWebSocket(serverAddr, serverIP, fallbackAddr, token string) (*websocket.Conn, error) {
 	parts := strings.SplitN(serverAddr, "#", 2)
 	if len(parts) == 2 {
@@ -396,22 +465,16 @@ func dialCleanWebSocket(serverAddr, serverIP, fallbackAddr, token string) (*webs
 			sniPort = "443"
 		}
 
-		realIP, realPort, err := net.SplitHostPort(realAddr)
-		if err != nil {
-			realIP = realAddr
-			realPort = sniPort
-		}
-
-		wsURL := buildWsURL(sniHost, realPort, token, fallbackAddr)
+		wsURL := buildWsURL(sniHost, sniPort, token, fallbackAddr)
 		reqHeader := http.Header{}
 		reqHeader.Add("Host", sniHost)
 		reqHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
 		dialer := websocket.Dialer{
 			TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: sniHost},
-			HandshakeTimeout: 5 * time.Second,
+			HandshakeTimeout: 10 * time.Second,
 			NetDial: func(network, addr string) (net.Conn, error) {
-				return net.DialTimeout(network, net.JoinHostPort(realIP, realPort), 5*time.Second)
+				return smartDialTCP(realAddr, sniPort, 5*time.Second)
 			},
 		}
 
@@ -441,13 +504,18 @@ func dialCleanWebSocket(serverAddr, serverIP, fallbackAddr, token string) (*webs
 
 	dialer := websocket.Dialer{
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: tlsHost},
-		HandshakeTimeout: 5 * time.Second,
+		HandshakeTimeout: 10 * time.Second,
 	}
 
 	if serverIP != "" {
 		dialer.NetDial = func(network, addr string) (net.Conn, error) {
 			_, p, _ := net.SplitHostPort(addr)
-			return net.DialTimeout(network, net.JoinHostPort(serverIP, p), 5*time.Second)
+			return smartDialTCP(serverIP, p, 5*time.Second)
+		}
+	} else {
+		dialer.NetDial = func(network, addr string) (net.Conn, error) {
+			h, p, _ := net.SplitHostPort(addr)
+			return smartDialTCP(h, p, 5*time.Second)
 		}
 	}
 
@@ -744,9 +812,6 @@ func GenerateConfigJSON(serverAddr, serverIP, secretKey, fallbackAddr, listenAdd
 		string(listenJSON), serverJSON, string(tokenJSON), string(rulesJSON), serverIPJSON, fallbackJSON,
 	)
 }
-
-
-
 
 
 
