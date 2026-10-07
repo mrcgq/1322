@@ -1,3 +1,4 @@
+
 //文件三：main.go (Go CLI 入口)
 
 // =========================================================================================
@@ -21,9 +22,6 @@ import (
 )
 
 func main() {
-	// 强制使用纯 Go DNS 解析器，消除 CGO 依赖并在 Windows 平台实现无损并发解析
-	_ = os.Setenv("GODEBUG", "netdns=go")
-
 	pipeMode := flag.Bool("pipe-stdin", false, "Read JSON configuration securely from STDIN stream")
 	flag.Parse()
 
@@ -60,6 +58,9 @@ func main() {
 		_ = listener.Close()
 	}
 }
+
+
+
 
 
 
